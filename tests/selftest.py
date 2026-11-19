@@ -257,6 +257,15 @@ def test_apply_flow():
     check("정상 신청 → 성공", res["status"] == "성공", f"{res['status']} / {res['reason']}")
     check("신청 버튼 클릭 발생", any("신청" in c for c in page.clicks), str(page.clicks))
 
+    page = FakePage(["위시에 담기", "신청 완료하기", "확인"], "배송지 서울시 중구 세종대로 110")
+    res = main.apply_one(page, campaign)
+    check("위시 담기 단계 처리", any("위시" in c for c in page.clicks), str(page.clicks))
+    check("위시 + 신청 → 성공", res["status"] == "성공", f"{res['status']} / {res['reason']}")
+
+    page = FakePage(["위시에 담기", "신청 완료하기", "확인"], "배송지 서울시 중구 세종대로 110")
+    main.apply_one(page, campaign, skip_wishlist=True)
+    check("--skip-wishlist 시 위시 클릭 없음", all("위시" not in c for c in page.clicks), str(page.clicks))
+
     page = FakePage(["신청 완료하기"], "이미 신청한 체험단입니다")
     res = main.apply_one(page, campaign)
     check("이미 신청 → 스킵", res["status"] == "스킵", f"{res['status']} / {res['reason']}")

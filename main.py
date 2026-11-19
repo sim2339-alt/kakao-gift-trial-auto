@@ -497,6 +497,24 @@ def _ensure_default_address(page) -> str:
     return f"배송지 선택: {picked or '실패'}"
 
 
+def _ensure_wishlist(page, enabled: bool = True) -> str:
+    """
+    선물함(위시) 담기 단계가 있는 화면이면 처리한다.
+    실제 앱 사용 순서가 [위시에 담기] → [체험단 신청하기] 인 경우가 있어 best-effort 로 시도한다.
+    버튼이 없으면 아무 것도 하지 않는다.
+    """
+    if not enabled:
+        return "위시 단계 생략"
+    clicked = _click_first(page, [r"위시에\s*담기", r"위시\s*담기", r"찜하기"])
+    if not clicked:
+        return "위시 버튼 없음"
+    page.wait_for_timeout(800)
+    _click_first(page, [r"친구\s*공개", r"전체\s*공개", r"공개로\s*담기"])
+    _click_first(page, [r"^확인$", r"^담기$", r"^저장$"])
+    page.wait_for_timeout(500)
+    return f"위시 담기 시도({clicked})"
+
+
 def _check_agreements(page) -> int:
     """필수 동의 체크박스가 있으면 체크."""
     count = 0
@@ -526,7 +544,7 @@ def _dump_failure(page, cid: str, tag: str = "fail"):
         return None
 
 
-def apply_one(page, campaign: dict) -> dict:
+def apply_one(page, campaign: dict, skip_wishlist: bool = False) -> dict:
     """캠페인 1건 신청. 결과 dict 반환(status: 성공/스킵/실패/불확실)."""
     cid = campaign.get("campaignId") or ""
     result = {
@@ -589,6 +607,7 @@ def apply_one(page, campaign: dict) -> dict:
             return result
 
         addr = _ensure_default_address(page)
+        wish = _ensure_wishlist(page, enabled=not skip_wishlist)
         agree = _check_agreements(page)
 
         clicked = _click_first(page, [
@@ -646,13 +665,13 @@ def apply_one(page, campaign: dict) -> dict:
             except Exception:
                 pass
             if success:
-                result.update(status="성공", reason=f"POST {last['status']} / 배송지:{addr} / 동의{agree}건")
+                result.update(status="성공", reason=f"POST {last['status']} / 배송지:{addr} / {wish} / 동의{agree}건")
             else:
                 result.update(status="실패", reason=f"신청 응답 {last['status']} {str(last.get('body'))[:120]}")
             return result
 
         if success:
-            result.update(status="성공", reason=f"신청 완료 화면 확인 / 배송지:{addr} / 동의{agree}건")
+            result.update(status="성공", reason=f"신청 완료 화면 확인 / 배송지:{addr} / {wish} / 동의{agree}건")
         else:
             path = _dump_failure(page, cid)
             result.update(status="불확실", reason=f"결과 확인 실패(화면 저장: {path})")
@@ -696,7 +715,7 @@ def run_apply(candidates: list, args) -> int:
             title = (item.get("campaignTitle") or "")[:36]
             print(f"\n({idx}/{len(targets)}) {title} … ", end="", flush=True)
             try:
-                res = apply_one(page, item)
+                res = apply_one(page, item, skip_wishlist=args.skip_wishlist)
             except LoginRequired:
                 print("로그인 필요 → 중단")
                 print("[중단] 로그인이 풀렸습니다. run_login.bat 으로 다시 로그인한 뒤 재실행하세요.")
@@ -742,6 +761,8 @@ def main(argv=None) -> int:
     ap.add_argument("--delay-min", type=float, default=1.5, help="건별 최소 대기 초 (기본 1.5)")
     ap.add_argument("--delay-max", type=float, default=3.0, help="건별 최대 대기 초 (기본 3.0)")
     ap.add_argument("--headless", action="store_true", help="브라우저 창 없이 실행(디버깅 어려움)")
+    ap.add_argument("--skip-wishlist", action="store_true",
+                    help="위시(선물함)에 담는 단계를 건너뜀")
     ap.add_argument("--include-unknown", action="store_true",
                     help="카테고리 정보가 없는 상품까지 신청 대상에 포함(기본은 보류)")
     args = ap.parse_args(argv)
