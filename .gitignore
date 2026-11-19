@@ -1,0 +1,15 @@
+# 로그인 세션(브라우저 프로필) — 절대 공유/커밋 금지
+kakao_profile/
+
+# 실행 결과물
+logs/
+*.csv
+
+# 파이썬
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 환경변수
+.env
