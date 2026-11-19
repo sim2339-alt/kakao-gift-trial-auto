@@ -252,7 +252,7 @@ def test_apply_flow():
         }],
     }
 
-    page = FakePage(["배송지 변경", "신청 완료하기", "확인"], "배송지 서울시 용인시 수지구 123")
+    page = FakePage(["배송지 변경", "신청 완료하기", "확인"], "배송지 서울시 중구 세종대로 110")
     res = main.apply_one(page, campaign)
     check("정상 신청 → 성공", res["status"] == "성공", f"{res['status']} / {res['reason']}")
     check("신청 버튼 클릭 발생", any("신청" in c for c in page.clicks), str(page.clicks))
