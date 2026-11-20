@@ -13,6 +13,14 @@
     로그인 세션은 ./kakao_profile 폴더(브라우저 프로필)와 kakao_state.json(세션 백업)에만 남습니다.
   - 로그인은 반드시 '데스크톱 웹 로그인' 경로로 합니다(아래 _login_url 설명 참고).
     모바일 화면에서 로그인 버튼을 누르면 카카오톡 앱 안내로 빠져 PC에서는 로그인이 완결되지 않습니다.
+
+신청 순서(2026-11-20 실측, gift 번들 chunk-TXTX3FXH / chunk-2BRB6BUS 기준)
+  1) 상세 페이지: 상품을 위시(선물함)에 담기  ← 이 단계를 건너뛰면 상세 페이지가 신청을 막습니다.
+  2) 상세 페이지: [선물 체험단 신청하기] → 옵션이 있는 캠페인은 옵션 선택 레이어에서 하나 고름
+  3) 신청 페이지(/apply?optionId=…): 신청 완료하기 → POST /a/partner-trial/api/v1/trial-campaigns/apply
+  · 신청 페이지는 옵션을 화면에서 고르지 않고 URL query 의 optionId 만 읽습니다.
+    optionId 없이 들어가면 옵션 칸이 빈 채로 신청되어 서버가 거부하고
+    '체험단에 응모하지 못했어요 / 고객센터로 문의해 주세요' 팝업이 뜨게 됩니다.
 """
 
 from __future__ import annotations
@@ -41,6 +49,12 @@ HISTORY_API = BASE + "/a/partner-trial/api/v1/trial-campaigns/apply"
 APPLY_API_PATH = "/a/partner-trial/api/v1/trial-campaigns/apply"
 DETAIL_PAGE = BASE + "/giftbox/trial-campaign/{cid}"
 APPLY_PAGE = BASE + "/giftbox/trial-campaign/{cid}/apply"
+# 신청 페이지가 실제로 쓰는 캠페인 상세(옵션 목록·위시 필요 여부·신청 여부).
+DETAIL_API = BASE + "/a/partner-trial/api/v1/trial-campaigns/{cid}"
+# 상품 위시(선물함) 담김 여부. 응답: {"wished": bool, "visibleTo": "others"|"me"|null}
+WISH_STATE_API = BASE + "/a/product-detail/v1/items/{pid}/wishes/wish"
+# 신청이 거부될 때 화면에 뜨는 catch-all 팝업 문구(번들 chunk-2BRB6BUS 실측)
+APPLY_DENIED_TEXT = "체험단에 응모하지 못했어요"
 
 # 모바일 UA 필수: 데스크톱 UA로 접근하면 PC 제한(/pc-restricted) 화면으로 막힐 수 있음
 MOBILE_UA = (
@@ -761,8 +775,124 @@ def _click_first(page, patterns, scope=None, timeout: int = 3000) -> str | None:
     return None
 
 
+def _json_get(page, url: str, referer: str = "") -> tuple:
+    """브라우저 세션 쿠키를 그대로 쓴 JSON GET. 반환: (data, 오류문자열). 401 은 LoginRequired."""
+    headers = {"User-Agent": MOBILE_UA, "Accept": "application/json, text/plain, */*"}
+    if referer:
+        headers["Referer"] = referer
+    try:
+        resp = page.context.request.get(url, headers=headers, timeout=20000)
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {str(exc)[:80]}"
+    if resp.status == 401:
+        raise LoginRequired()
+    if resp.status != 200:
+        return None, f"HTTP {resp.status}"
+    try:
+        return resp.json(), ""
+    except Exception:
+        return None, "JSON 아님"
+
+
+def fetch_campaign_detail(page, cid: str) -> tuple:
+    """캠페인 상세를 읽어 옵션 목록·위시 필요 여부·신청 여부를 확보한다.
+
+    신청 페이지(pw-trial-campaign-apply)와 상세 페이지가 쓰는 것과 같은 API 다.
+    반환: (detail dict 또는 None, 오류문자열)
+    """
+    if not cid:
+        return None, "campaignId 없음"
+    data, err = _json_get(page, DETAIL_API.format(cid=cid), APPLY_PAGE.format(cid=cid))
+    if not isinstance(data, dict) or not data.get("campaignId"):
+        return None, err or "상세 응답 형식 아님"
+    return data, ""
+
+
+def option_choices(detail: dict | None) -> list:
+    """상세 응답의 옵션 목록 → [(id, 이름)]"""
+    out = []
+    for opt in (detail or {}).get("options") or []:
+        oid = opt.get("id")
+        if oid is not None:
+            out.append((oid, opt.get("value") or ""))
+    return out
+
+
+def apply_url(cid: str, detail: dict | None) -> tuple:
+    """신청 페이지 주소. 옵션이 있는 캠페인은 optionId 를 query 로 넘겨야 신청이 성립한다.
+
+    (번들 chunk-2BRB6BUS: apply 페이지는 옵션을 화면에서 고르지 않고 activatedRoute.queryParams
+     의 optionId 만 읽는다. 없으면 selectedOption=null → POST body 에 optionId 가 빠져 서버가 거부한다.)
+    반환: (url, 옵션 이름)
+    """
+    opts = option_choices(detail)
+    base = APPLY_PAGE.format(cid=cid)
+    if opts:
+        return f"{base}?optionId={opts[0][0]}", str(opts[0][1])
+    return base, ""
+
+
+def _wish_state(page, product_id) -> bool | None:
+    """위시 담김 여부(친구 공개 기준). 확인 못 하면 None."""
+    if not product_id:
+        return None
+    data, _ = _json_get(page, WISH_STATE_API.format(pid=product_id), DETAIL_PAGE.format(cid=""))
+    if not isinstance(data, dict):
+        return None
+    return data.get("wished") is True and (data.get("visibleTo") or "") == "others"
+
+
+def _ensure_wish(page, detail: dict | None, enabled: bool = True) -> str:
+    """체험단 신청 STEP 1 — 상품을 위시(선물함)에 담는다.
+
+    신청 페이지(/apply)에는 위시 버튼이 없다. 위시는 상세 페이지에서만 담을 수 있고,
+    상세 페이지는 위시하지 않은 상품의 신청 버튼을 레이어로 막는다.
+    그래서 실제 사용자 순서와 같이 상세 페이지에서 담는다.
+    """
+    if not enabled:
+        return "위시 단계 생략"
+    if not detail:
+        return "위시 확인 불가(상세 정보 없음)"
+    if detail.get("wishable") is False:
+        return "위시 대상 아님"
+
+    cid = detail.get("campaignId") or ""
+    pid = detail.get("productId")
+    try:
+        page.goto(DETAIL_PAGE.format(cid=cid), wait_until="domcontentloaded")
+        page.wait_for_timeout(int(random.uniform(1000, 1600)))
+    except Exception as exc:
+        return f"위시 페이지 열기 실패({type(exc).__name__})"
+    try:
+        body = page.inner_text("body", timeout=4000)
+    except Exception:
+        body = ""
+
+    if "위시 했어요" in body:
+        return "이미 위시함"
+    clicked = _click_first(page, [r"위시에\s*담기", r"위시\s*담기", r"찜하기"])
+    if not clicked:
+        if _wish_state(page, pid) is True:
+            return "이미 위시함"
+        return "위시 버튼 없음(위시 못 함)"
+
+    page.wait_for_timeout(int(random.uniform(800, 1300)))
+    _click_first(page, [r"친구\s*공개로\s*담기", r"^확인$", r"^담기$", r"^위시$"])
+    page.wait_for_timeout(400)
+    state = _wish_state(page, pid)
+    if state is True:
+        return "위시 담기 완료"
+    if state is False:
+        return "위시 담기 실패(서버 미반영)"
+    return f"위시 담기 시도({clicked})"
+
+
 def _ensure_default_address(page) -> str:
-    """기본 배송지가 선택되어 있는지 확인하고, 선택 창이 뜨면 기본 배송지를 고른다."""
+    """배송지는 사이트가 계정 기본 배송지로 자동 채운다.
+
+    이미 채워져 있으면 아무 것도 건드리지 않는다. '배송지 변경하기'를 눌러 레이어를 열면
+    신청 버튼이 가려져 오히려 실패한다. 비어 있을 때만 '배송지 선택하기'로 기본 배송지를 고른다.
+    """
     try:
         body = page.inner_text("body", timeout=3000)
     except Exception:
@@ -770,13 +900,13 @@ def _ensure_default_address(page) -> str:
     if "배송지" not in body:
         return "배송지 영역 없음(무시)"
 
-    # 이미 주소가 표시되어 있으면 그대로 사용
-    if re.search(r"(로|길|동|읍|면)\s*\d", body):
-        return "기본 배송지 표시됨"
+    need_select = "입력된 배송지 정보가 없어요" in body or "배송지 선택하기" in body
+    if not need_select:
+        return "기본 배송지 자동 선택됨"
 
-    clicked = _click_first(page, [r"배송지\s*선택", r"배송지\s*변경", r"주소\s*선택"])
+    clicked = _click_first(page, [r"배송지\s*선택하기", r"배송지\s*선택", r"주소\s*선택"])
     if not clicked:
-        return "배송지 선택 버튼 없음"
+        return "배송지 비어 있음(선택 버튼 못 찾음)"
     page.wait_for_timeout(800)
 
     picked = _click_first(page, [r"기본\s*배송지", r"^선택$", r"^배송지$"])
@@ -794,22 +924,17 @@ def _ensure_default_address(page) -> str:
     return f"배송지 선택: {picked or '실패'}"
 
 
-def _ensure_wishlist(page, enabled: bool = True) -> str:
-    """
-    선물함(위시) 담기 단계가 있는 화면이면 처리한다.
-    실제 앱 사용 순서가 [위시에 담기] → [체험단 신청하기] 인 경우가 있어 best-effort 로 시도한다.
-    버튼이 없으면 아무 것도 하지 않는다.
-    """
-    if not enabled:
-        return "위시 단계 생략"
-    clicked = _click_first(page, [r"위시에\s*담기", r"위시\s*담기", r"찜하기"])
-    if not clicked:
-        return "위시 버튼 없음"
-    page.wait_for_timeout(800)
-    _click_first(page, [r"친구\s*공개", r"전체\s*공개", r"공개로\s*담기"])
-    _click_first(page, [r"^확인$", r"^담기$", r"^저장$"])
-    page.wait_for_timeout(500)
-    return f"위시 담기 시도({clicked})"
+def apply_failure_hint(text: str) -> str:
+    """신청 실패 화면에서 원인을 사람이 읽을 수 있는 문장으로 바꾼다."""
+    if not text:
+        return ""
+    if APPLY_DENIED_TEXT in text:
+        return "화면 팝업: 체험단에 응모하지 못했어요 / 고객센터로 문의(서버가 신청을 거부)"
+    if "배송지 정보를 입력해주세요" in text:
+        return "화면 팝업: 배송지 정보를 입력해주세요"
+    if "옵션" in text and "optionId" in text:
+        return "화면 오류: 옵션(optionId) 누락"
+    return ""
 
 
 def _check_agreements(page) -> int:
@@ -880,7 +1005,22 @@ def apply_one(page, campaign: dict, skip_wishlist: bool = False) -> dict:
 
     page.on("response", on_response)
     try:
-        page.goto(APPLY_PAGE.format(cid=cid), wait_until="domcontentloaded")
+        # 0) 상세 정보: 신청 페이지가 쓰는 것과 같은 API 로 옵션·위시·신청 여부를 먼저 확인한다.
+        detail, detail_err = fetch_campaign_detail(page, cid)
+        if detail:
+            if detail.get("applied") is True:
+                result.update(status="스킵", reason="이미 신청한 체험단")
+                return result
+            if detail.get("campaignStatus") not in (None, "IN_PROGRESS"):
+                result.update(status="스킵", reason=f"모집 중 아님({detail.get('campaignStatus')})")
+                return result
+
+        # 1) STEP 1: 위시 담기 — 신청 페이지에는 버튼이 없어 상세 페이지에서 해야 한다.
+        wish = _ensure_wish(page, detail, enabled=not skip_wishlist)
+
+        # 2) 신청 페이지: 옵션이 있는 캠페인은 optionId 를 query 로 넘겨야 신청이 성립한다.
+        url, opt_name = apply_url(cid, detail)
+        page.goto(url, wait_until="domcontentloaded")
         page.wait_for_timeout(int(random.uniform(1200, 2000)))
 
         try:
@@ -906,8 +1046,10 @@ def apply_one(page, campaign: dict, skip_wishlist: bool = False) -> dict:
             return result
 
         addr = _ensure_default_address(page)
-        wish = _ensure_wishlist(page, enabled=not skip_wishlist)
         agree = _check_agreements(page)
+        option_note = f"옵션:{opt_name[:18]}" if opt_name else "옵션 없음"
+        if detail is None:
+            option_note += f"(상세 조회 실패: {detail_err or '알 수 없음'})"
 
         clicked = _click_first(page, [
             r"신청\s*완료하기", r"체험단\s*신청하기", r"신청\s*완료", r"신청하기", r"^신청$",
@@ -948,11 +1090,13 @@ def apply_one(page, campaign: dict, skip_wishlist: bool = False) -> dict:
                 tail = page.inner_text("body", timeout=2500)
             except Exception:
                 tail = ""
-            if re.search(r"신청\s*(이)?\s*완료", tail):
+            if re.search(r"신청\s*(이)?\s*완료", tail) and APPLY_DENIED_TEXT not in tail:
                 success = True
             elif "이미 신청" in tail:
                 result.update(status="스킵", reason="이미 신청한 체험단")
                 return result
+        else:
+            tail = ""
 
         if api_calls:
             last = api_calls[-1]
@@ -964,13 +1108,23 @@ def apply_one(page, campaign: dict, skip_wishlist: bool = False) -> dict:
             except Exception:
                 pass
             if success:
-                result.update(status="성공", reason=f"POST {last['status']} / 배송지:{addr} / {wish} / 동의{agree}건")
+                result.update(status="성공",
+                              reason=f"POST {last['status']} / 배송지:{addr} / {wish} / 동의{agree}건 / {option_note}")
             else:
-                result.update(status="실패", reason=f"신청 응답 {last['status']} {str(last.get('body'))[:120]}")
+                body = last.get("body")
+                server_msg = ""
+                if isinstance(body, dict):
+                    server_msg = str(body.get("errorMessage") or body.get("message") or "")[:60]
+                    if body.get("errorCode") is not None:
+                        server_msg += f"(code {body.get('errorCode')})"
+                hint = apply_failure_hint(tail) or "서버 응답에 표준 에러 봉투 없음(500·게이트웨이·차단 응답)"
+                result.update(status="실패",
+                              reason=f"신청 응답 {last['status']} {server_msg or str(body)[:80]} / {hint} / {option_note}")
             return result
 
         if success:
-            result.update(status="성공", reason=f"신청 완료 화면 확인 / 배송지:{addr} / {wish} / 동의{agree}건")
+            result.update(status="성공",
+                          reason=f"신청 완료 화면 확인 / 배송지:{addr} / {wish} / 동의{agree}건 / {option_note}")
         else:
             path = _dump_failure(page, cid)
             result.update(status="불확실", reason=f"결과 확인 실패(화면 저장: {path})")
@@ -1044,6 +1198,10 @@ def run_apply(candidates: list, args) -> int:
     fail = sum(1 for r in results if r["status"] in ("실패", "불확실"))
     print("\n" + "=" * 60)
     print(f"결과 요약: 성공 {ok}건 / 스킵 {skip}건 / 실패·불확실 {fail}건")
+    if any("고객센터로 문의" in (r.get("reason") or "") for r in results):
+        print("\n[안내] '체험단에 응모하지 못했어요 / 고객센터로 문의' 팝업이 뜬 건이 있습니다.")
+        print("       이 문구는 신청 POST 가 서버에서 거부됐는데 표준 에러 응답이 아닐 때 뜼니다.")
+        print("       사유 란의 '신청 응답 <status>' 와 logs/last_apply_request.json 을 확인해 주세요.")
     if results:
         path = save_results_csv(results)
         print(f"결과 파일: {path.resolve()}")
@@ -1071,8 +1229,8 @@ def main(argv=None) -> int:
     ap.add_argument("--sort", choices=["popular", "deadline"], default="popular",
                     help="정렬 방식: popular(신청자 많은 순, 기본) / deadline(마감 임박 순)")
     ap.add_argument("--max-pages", type=int, default=30, help="목록 API 최대 페이지 수 (기본 30)")
-    ap.add_argument("--delay-min", type=float, default=1.5, help="건별 최소 대기 초 (기본 1.5)")
-    ap.add_argument("--delay-max", type=float, default=3.0, help="건별 최대 대기 초 (기본 3.0)")
+    ap.add_argument("--delay-min", type=float, default=5.0, help="건별 최소 대기 초 (기본 5.0)")
+    ap.add_argument("--delay-max", type=float, default=7.0, help="건별 최대 대기 초 (기본 7.0)")
     ap.add_argument("--headless", action="store_true", help="브라우저 창 없이 실행(디버깅 어려움)")
     ap.add_argument("--skip-wishlist", action="store_true",
                     help="위시(선물함)에 담는 단계를 건너뜀")

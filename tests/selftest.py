@@ -119,20 +119,63 @@ def test_filter():
 # ---------------------------------------------------- 2부: 가짜 브라우저 검증
 class FakeRequest:
     method = "POST"
-    post_data_json = {"campaignId": "abc"}
+    post_data_json = {"campaignId": "abc", "productId": 111, "optionId": 77}
 
 
 class FakeResponse:
-    def __init__(self, status=200):
+    def __init__(self, status=200, body=None):
         self.status = status
         self.url = main.BASE + main.APPLY_API_PATH
         self.request = FakeRequest()
+        self._body = {"result": True} if body is None else body
 
     def json(self):
-        return {"result": True}
+        if isinstance(self._body, Exception):
+            raise self._body
+        return self._body
 
     def text(self):
-        return '{"result": true}'
+        return json.dumps(self._body, ensure_ascii=False)
+
+
+class FakeApiResponse:
+    """page.context.request.get 응답 모사."""
+
+    def __init__(self, status=200, data=None):
+        self.status = status
+        self._data = data
+
+    def json(self):
+        if isinstance(self._data, Exception):
+            raise self._data
+        return self._data
+
+
+class FakeApiBridge:
+    """세션 쿠키가 붙은 GET (상세 조회 · 위시 상태 조회) 모사."""
+
+    def __init__(self):
+        self.detail = None
+        self.wish = False
+        self.calls = []
+
+    def get(self, url, headers=None, timeout=None):
+        self.calls.append(url)
+        if "/wishes/wish" in url:
+            return FakeApiResponse(200, {
+                "wished": self.wish,
+                "visibleTo": "others" if self.wish else None,
+            })
+        if isinstance(self.detail, Exception):
+            raise self.detail
+        if isinstance(self.detail, FakeApiResponse):
+            return self.detail
+        return FakeApiResponse(200, self.detail or {})
+
+
+class FakeContext:
+    def __init__(self):
+        self.request = FakeApiBridge()
 
 
 class FakeElement:
@@ -175,27 +218,70 @@ class FakeLocator:
         self.page.checked += 1
 
 
+DENIED_POPUP = "체험단에 응모하지 못했어요\n고객센터로 문의해주시면 도와드릴게요."
+
+
 class FakePage:
-    def __init__(self, buttons, body, url=None, on_apply_click="success", goto_redirect=None):
+    def __init__(self, buttons, body, url=None, on_apply_click="success", goto_redirect=None,
+                 wishable=False, options=None, applied=False, campaign_status="IN_PROGRESS",
+                 detail_api="ok"):
         self.buttons = buttons
+        self.apply_body = body
         self.body = body
-        self.tail_body = ""
         self.url = url or main.BASE + "/giftbox/trial-campaign/abc/apply"
         self.on_apply_click = on_apply_click
         self.goto_redirect = goto_redirect  # 로그인 페이지로 튕기는 상황 모사
         self.listeners = {}
         self.checked = 0
         self.clicks = []
+        self.goto_urls = []
+
+        # 상세 API 응답(신청 페이지·상세 페이지가 쓰는 것과 같은 정보)
+        if detail_api == "error":
+            detail = RuntimeError("detail fetch failed")
+        elif detail_api == "401":
+            detail = FakeApiResponse(401, {})
+        else:
+            detail = {
+                "campaignId": "abc",
+                "productId": 111,
+                "campaignTitle": "테스트 상품",
+                "itemType": "Shipping",
+                "campaignStatus": campaign_status,
+                "applied": applied,
+                "wishable": wishable,
+                "options": options or [],
+            }
+        self.context = FakeContext()
+        if isinstance(detail, FakeApiResponse):
+            self.context.request.detail = detail
+        elif isinstance(detail, Exception):
+            self.context.request.detail = detail
+        else:
+            self.context.request.detail = detail
+
+        # 상세 페이지(=신청 페이지 아님) 본문
+        self.detail_body = "친구 공개로 위시에 담기" if wishable else "상품 기본 정보"
+
+    @property
+    def wish_added(self):
+        return self.context.request.wish
 
     # --- playwright API 모사
     def goto(self, url, wait_until=None):
-        self.url = self.goto_redirect or url
+        self.goto_urls.append(url)
+        if self.goto_redirect:
+            self.url = self.goto_redirect
+            return
+        self.url = url
+        if "/apply" not in url:
+            self.body = self.detail_body
 
     def wait_for_timeout(self, ms):
         return None
 
     def inner_text(self, selector, timeout=None):
-        return self.tail_body or self.body
+        return self.body
 
     def content(self):
         return "<html><body>fake</body></html>"
@@ -228,14 +314,26 @@ class FakePage:
     # --- 클릭 처리
     def handle_click(self, text):
         self.clicks.append(text)
+        if "위시" in text and "담기" in text:
+            self.context.request.wish = True
+            self.detail_body = "친구 공개로 위시 했어요"
+            self.body = self.detail_body
+            return
         if "신청" in text and self.on_apply_click == "success":
             self.url = main.BASE + "/giftbox/trial-campaign/applied/abc"
             for cb in self.listeners.get("response", []):
                 cb(FakeResponse(200))
         elif "신청" in text and self.on_apply_click == "fail":
-            self.tail_body = "신청에 실패했습니다"
+            self.body = "신청에 실패했습니다"
             for cb in self.listeners.get("response", []):
-                cb(FakeResponse(400))
+                cb(FakeResponse(400, {"errorCategory": "common", "errorCode": -10001,
+                                      "errorMessage": "VALIDATION_ERROR", "errorName": "validation_error"}))
+        elif "신청" in text and self.on_apply_click == "denied":
+            # 서버가 표준 에러 봉투가 아닌 응답(500 기본 에러페이지)을 준 상황
+            self.body = self.apply_body + "\n" + DENIED_POPUP
+            for cb in self.listeners.get("response", []):
+                cb(FakeResponse(500, {"timestamp": "2026-11-20T10:00:00", "status": 500,
+                                      "error": "Internal Server Error", "path": "/a/partner-trial/api/v1/trial-campaigns/apply"}))
 
 
 def test_apply_flow():
@@ -252,29 +350,62 @@ def test_apply_flow():
             "mdisplayCategoryId": 203, "mdisplayCategoryName": "과일·견과",
         }],
     }
+    ADDR = "배송지 서울시 중구 세종대로 110"
+    APPLY = main.BASE + "/giftbox/trial-campaign/abc/apply"
+    DETAIL = main.BASE + "/giftbox/trial-campaign/abc"
 
-    page = FakePage(["배송지 변경", "신청 완료하기", "확인"], "배송지 서울시 중구 세종대로 110")
+    # 1) 옵션 없는 캠페인 → /apply 그대로 진입
+    page = FakePage(["신청 완료하기", "확인"], ADDR)
     res = main.apply_one(page, campaign)
     check("정상 신청 → 성공", res["status"] == "성공", f"{res['status']} / {res['reason']}")
     check("신청 버튼 클릭 발생", any("신청" in c for c in page.clicks), str(page.clicks))
+    check("옵션 없으면 optionId 없이 진입", page.goto_urls[-1] == APPLY, str(page.goto_urls))
+    check("사유에 옵션 정보 기록", "옵션 없음" in res["reason"], res["reason"])
 
-    page = FakePage(["위시에 담기", "신청 완료하기", "확인"], "배송지 서울시 중구 세종대로 110")
+    # 2) 옵션 있는 캠페인 → ?optionId=77 (이번 버그의 핵심 회귀 방지)
+    page = FakePage(["신청 완료하기", "확인"], ADDR, options=[{"id": 77, "value": "화이트"}])
+    res = main.apply_one(page, campaign)
+    check("옵션 있으면 ?optionId=77 로 진입", "?optionId=77" in page.goto_urls[-1], str(page.goto_urls))
+    check("옵션 캠페인 신청 → 성공", res["status"] == "성공", f"{res['status']} / {res['reason']}")
+
+    # 3) 위시가 필요한 캠페인 → 상세 페이지에서 위시 먼저
+    page = FakePage(["친구 공개로 위시에 담기", "신청 완료하기", "확인"], ADDR, wishable=True)
     res = main.apply_one(page, campaign)
     check("위시 담기 단계 처리", any("위시" in c for c in page.clicks), str(page.clicks))
+    check("위시 페이지를 신청 페이지보다 먼저 연다", bool(page.goto_urls) and page.goto_urls[0] == DETAIL, str(page.goto_urls))
+    check("위시 담김 상태 확인", page.wish_added is True)
     check("위시 + 신청 → 성공", res["status"] == "성공", f"{res['status']} / {res['reason']}")
 
-    page = FakePage(["위시에 담기", "신청 완료하기", "확인"], "배송지 서울시 중구 세종대로 110")
-    main.apply_one(page, campaign, skip_wishlist=True)
+    # 4) --skip-wishlist
+    page = FakePage(["친구 공개로 위시에 담기", "신청 완료하기", "확인"], ADDR, wishable=True)
+    res = main.apply_one(page, campaign, skip_wishlist=True)
     check("--skip-wishlist 시 위시 클릭 없음", all("위시" not in c for c in page.clicks), str(page.clicks))
+    check("--skip-wishlist 시 상세 페이지를 열지 않음",
+          all(APPLY in u for u in page.goto_urls), str(page.goto_urls))
+    check("--skip-wishlist 로도 신청 성공", res["status"] == "성공", f"{res['status']} / {res['reason']}")
 
-    page = FakePage(["신청 완료하기"], "이미 신청한 체험단입니다")
+    # 5) 이미 신청(상세 applied) → 스킵 (페이지를 열지 않는다)
+    page = FakePage(["신청 완료하기"], ADDR, applied=True)
     res = main.apply_one(page, campaign)
     check("이미 신청 → 스킵", res["status"] == "스킵", f"{res['status']} / {res['reason']}")
+    check("이미 신청이면 신청 페이지를 열지 않음", page.goto_urls == [], str(page.goto_urls))
 
+    # 6) 모집 중이 아닌 캠페인 → 스킵
+    page = FakePage(["신청 완료하기"], ADDR, campaign_status="ANNOUNCING")
+    res = main.apply_one(page, campaign)
+    check("모집 중 아님 → 스킵", res["status"] == "스킵", f"{res['status']} / {res['reason']}")
+
+    # 7) 화면에 '이미 신청' 문구 → 스킵
+    page = FakePage(["신청 완료하기"], "이미 신청한 체험단입니다")
+    res = main.apply_one(page, campaign)
+    check("본문 '이미 신청' → 스킵", res["status"] == "스킵", f"{res['status']} / {res['reason']}")
+
+    # 8) 신청 버튼 없음 → 실패
     page = FakePage([], "배송지 서울시 123")
     res = main.apply_one(page, campaign)
     check("신청 버튼 없음 → 실패", res["status"] == "실패", f"{res['status']} / {res['reason']}")
 
+    # 9) 로그인 페이지로 튕김 → LoginRequired
     page = FakePage(["신청 완료하기"], "로그인",
                    goto_redirect="https://accounts.kakao.com/login?continue=x")
     try:
@@ -290,9 +421,45 @@ def test_apply_flow():
     except main.LoginRequired:
         check("본문에 로그인 안내 → LoginRequired 예외", True)
 
-    page = FakePage(["신청 완료하기"], "배송지 서울시 123", on_apply_click="fail")
+    # 10) 상세 API 가 401 → LoginRequired
+    page = FakePage(["신청 완료하기"], ADDR, detail_api="401")
+    try:
+        main.apply_one(page, campaign)
+        check("상세 API 401 → LoginRequired 예외", False, "예외 없음")
+    except main.LoginRequired:
+        check("상세 API 401 → LoginRequired 예외", True)
+
+    # 11) 상세 API 실패 → 상세 없이 계속 진행(경고 기록)
+    page = FakePage(["신청 완료하기"], ADDR, detail_api="error")
+    res = main.apply_one(page, campaign)
+    check("상세 조회 실패해도 신청은 진행", res["status"] == "성공", f"{res['status']} / {res['reason']}")
+    check("사유에 상세 조회 실패 기록", "상세 조회 실패" in res["reason"], res["reason"])
+
+    # 12) 표준 에러 봉투(400) → 서버 errorMessage 를 사유에 남긴다
+    page = FakePage(["신청 완료하기"], ADDR, on_apply_click="fail")
     res = main.apply_one(page, campaign)
     check("신청 응답 400 → 실패", res["status"] == "실패", f"{res['status']} / {res['reason']}")
+    check("400 사유에 서버 errorMessage 포함", "VALIDATION_ERROR" in res["reason"], res["reason"])
+
+    # 13) '체험단에 응모하지 못했어요 / 고객센터' 팝업(비표준 응답) → 사유에 그대로 남긴다
+    page = FakePage(["신청 완료하기"], ADDR, on_apply_click="denied")
+    res = main.apply_one(page, campaign)
+    check("비표준 응답(500) → 실패", res["status"] == "실패", f"{res['status']} / {res['reason']}")
+    check("사유에 신청 응답 500 기록", "500" in res["reason"], res["reason"])
+    check("사유에 '고객센터로 문의' 팝업 안내 기록", "고객센터로 문의" in res["reason"], res["reason"])
+
+    # 14) 배송지: 이미 채워져 있으면 '배송지 변경'을 누르지 않는다(레이어가 신청 버튼을 가리는 문제 방지)
+    page = FakePage(["배송지 변경하기", "신청 완료하기", "확인"], ADDR)
+    main.apply_one(page, campaign)
+    check("배송지가 있으면 변경 레이어를 열지 않음",
+          all("변경" not in c for c in page.clicks), str(page.clicks))
+
+    # 15) 배송지가 비었을 때만 선택 단계 수행
+    page = FakePage(["배송지 선택하기", "기본 배송지", "확인", "신청 완료하기"],
+                    "배송지 정보\n입력된 배송지 정보가 없어요!")
+    main.apply_one(page, campaign)
+    check("배송지가 비면 선택 단계 수행", any("선택하기" in c for c in page.clicks), str(page.clicks))
+
 
 
 def cleanup():
