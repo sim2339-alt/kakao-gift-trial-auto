@@ -31,7 +31,7 @@ from pathlib import Path
 
 import main
 
-APP_VERSION = "2.4"
+APP_VERSION = "2.5"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 LOG_MAX = 4000          # 로그 창에 보관할 최대 줄 수
@@ -442,6 +442,7 @@ def reload_columns() -> dict:
 
 
 def check_login() -> dict:
+    """로그인 상태 + 지금 로그인된 계정 닉네임을 읽어 화면 상태에 넣는다."""
     state = main.login_state()
     with STATE["lock"]:
         STATE["login"] = state
@@ -521,7 +522,8 @@ def api_status() -> dict:
 # ---------------------------------------------------------------------------
 # 2. 미리보기 (신청 없이 후보만 선정)
 # ---------------------------------------------------------------------------
-def plan_summary(mode: str, stat: dict, total: int, applied_checked: bool) -> str:
+def plan_summary(mode: str, stat: dict, total: int, applied_checked: bool,
+                 applied_count: int | None = None) -> str:
     if mode == "notion":
         parts = [f"노션 DB {stat.get('rows', 0)}행",
                  f"내 열 체크 완료 {stat.get('checked', 0)}행 제외",
@@ -537,8 +539,15 @@ def plan_summary(mode: str, stat: dict, total: int, applied_checked: bool) -> st
         if not applied_checked:
             parts.append("신청 이력 확인 불가(로그인 필요)")
         return " · ".join(parts) + f" → 신청 대상 {total}건"
-    return (f"카카오 목록 허용 {total}건 (보류 {stat.get('held', 0)} · "
-            f"제외 {stat.get('denied', 0)}) → 신청 대상 {total}건")
+    parts = [f"카카오 목록 허용 {total}건",
+             f"보류 {stat.get('held', 0)}"]
+    if applied_count:
+        parts.append(f"제외 {stat.get('denied', 0)}건(이미 신청 {applied_count}건 포함)")
+    else:
+        parts.append(f"제외 {stat.get('denied', 0)}건")
+    if not applied_checked:
+        parts.append("신청 이력 확인 불가(로그인 필요)")
+    return " · ".join(parts) + f" → 신청 대상 {total}건"
 
 
 def normalize_limit(limit, default: int | None = None) -> int:
@@ -585,6 +594,12 @@ def preview(mode: str = "notion", limit=main.LIMIT_DEFAULT, column: str | None =
     if not items:
         return {"ok": False, "error": "진행 중인 체험단을 가져오지 못했습니다. 인터넷 연결을 확인해 주세요."}
     applied = main.collect_applied_ids()
+    # 신청 이력에서 걸러 낸 건수 — 로그인 전(이력 확인 불가)이면 None
+    applied_count = len(applied) if applied is not None else None
+    applied_in_list = 0
+    if applied:
+        live_ids = {it.get("campaignId") for it in items if it.get("campaignId")}
+        applied_in_list = len(live_ids & applied)
     flt = main.load_filter()
     if mode == "notion":
         rows = main.notion_rows(notion_cfg)
@@ -600,7 +615,9 @@ def preview(mode: str = "notion", limit=main.LIMIT_DEFAULT, column: str | None =
     return {
         "ok": True, "mode": mode, "limit": limit, "total": len(picked),
         "applied_checked": applied is not None,
-        "summary": plan_summary(mode, stat, len(picked), applied is not None),
+        "applied_count": applied_count,
+        "applied_in_list": applied_in_list,
+        "summary": plan_summary(mode, stat, len(picked), applied is not None, applied_in_list),
         "stat": stat,
         "items": [main.candidate_row(i) for i in (picked[:limit] if limit > 0 else picked)],
         "held": [main.candidate_row(i) for i in held[:20]],
@@ -1143,10 +1160,13 @@ async function refreshStatus(){
   try { st = await api("/api/status"); } catch(e) { return; }
   $("ver").textContent = st.version || "-";
   const login = st.login || {};
-  if(login.state === "ok") setPill($("loginPill"), "ok", "카카오 로그인 유지 중");
+  /* 지금 로그인된 카카오 계정 — 서브.연 / 서브.오 를 바꿨는지 배지에서 바로 본다 */
+  const acct = login.nickname || (login.account && login.account.masked_key) || "";
+  if(login.state === "ok") setPill($("loginPill"), "ok", acct ? "로그인됨 · " + acct : "로그인됨 · 계정 이름 확인 불가");
   else if(login.state === "none") setPill($("loginPill"), "warn", login.detail || "로그인 필요");
   else setPill($("loginPill"), "", login.detail || "로그인 확인 필요");
-  $("loginPill").title = (login.detail || "") + (login.checked_at ? " · 확인 " + login.checked_at : "");
+  $("loginPill").title = (login.detail || "") + (acct ? " · 계정: " + acct : "")
+    + (login.checked_at ? " · 확인 " + login.checked_at : "");
 
   const n = st.notion || {};
   if(n.state === "saved") setPill($("notionPill"), "ok", "노션 설정 저장됨 · " + (n.column || "열 없음"));

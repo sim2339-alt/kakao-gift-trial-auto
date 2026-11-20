@@ -12,6 +12,7 @@
 - 8부: 원스톱 실행기(run.bat)와 루트 정리, 웹 조종판 한 화면 흐름 검증
 - 9부: 카카오 로그아웃(세션 파일 삭제 → 다른 계정 로그인) — CLI·웹 검증
 - 10부: 담당자 열 목록 — 노션 페이지 주소 붙여넣기 정규화 · `_columns` 폴백 · [↻ 새로고침] 검증
+- 11부: 계정 전환 캐시 — 세션 파일이 바뀌면 새 쿠키 · 로그아웃 초기화 · 로그인 계정 닉네임 · 이미 신청 건수 검증
 """
 
 from __future__ import annotations
@@ -85,7 +86,7 @@ def build_item(title, cats):
 
 
 def test_filter():
-    print("[1/10] 필터 검증")
+    print("[1/11] 필터 검증")
     flt = main.load_filter()
     cases = {
         "수플린 설향딸기 800g": "allow",
@@ -348,7 +349,7 @@ class FakePage:
 
 
 def test_apply_flow():
-    print("[2/10] 신청 플로우 검증 (가짜 브라우저)")
+    print("[2/11] 신청 플로우 검증 (가짜 브라우저)")
     campaign = {
         "campaignId": "abc",
         "campaignTitle": "테스트 상품",
@@ -603,7 +604,7 @@ class use_input:
 
 
 def test_notion():
-    print("[4/10] 노션 기록·설정·실행 모드 검증 (가짜 노션 API)")
+    print("[4/11] 노션 기록·설정·실행 모드 검증 (가짜 노션 API)")
     NOW = datetime(2026, 11, 20, 11, 0, 0)
     CFG = {"token": "ntn_dummy", "db_id": "db-dummy", "column": "메인.엽", "file": "notion_secret.json"}
     item = {
@@ -855,7 +856,7 @@ class FakeStdin:
 
 
 def test_main_modes():
-    print("[5/10] 실행 모드 통합 검증 (main() — 네트워크·브라우저 없이)")
+    print("[5/11] 실행 모드 통합 검증 (main() — 네트워크·브라우저 없이)")
     items = [
         build_item("스누피 3단 전기요", [(97, "디지털·가전", 163, "계절가전")]),
         build_item("수플린 설향딸기 800g", [(93, "식품", 203, "과일·견과")]),
@@ -978,7 +979,7 @@ def cleanup():
 
 # --------------------------------------------- 6부: 웹 조종판(web_ui) 검증
 def test_web():
-    print("[6/10] 웹 조종판 API 검증 (가짜 카카오·노션, 실제 HTTP 서버)")
+    print("[6/11] 웹 조종판 API 검증 (가짜 카카오·노션, 실제 HTTP 서버)")
     import web_ui
 
     web_ui.reset_state()
@@ -1169,7 +1170,7 @@ def test_web():
 
 
 def test_login_logic():
-    print("[3/10] 로그인 로직 검증 (네트워크 없이)")
+    print("[3/11] 로그인 로직 검증 (네트워크 없이)")
     url = main._login_url()
     check("로그인 주소가 웹 로그인 입구(shopping-userauth-web)인가",
           url.startswith("https://shopping-userauth-web.kakao.com/login?channel=GIFT&redirect_url="), url[:80])
@@ -1240,7 +1241,7 @@ def test_login_logic():
 
 # --------------------- 7부: 노션 1회 저장 · 담당자 열만 선택(다시 묻지 않음)
 def test_notion_once():
-    print("[7/10] 노션 1회 저장 · 담당자 열만 선택 검증 (가짜 노션 API)")
+    print("[7/11] 노션 1회 저장 · 담당자 열만 선택 검증 (가짜 노션 API)")
     tmp = ROOT / "logs" / "_once_notion_secret.json"
     tmp.parent.mkdir(exist_ok=True)
     tmp.write_text(json.dumps({"enabled": True, "token": "ntn_saved_once", "db_id": "db-once",
@@ -1422,7 +1423,7 @@ def test_notion_once():
 
 # ------------------------------- 8부: 원스톱 실행(run.bat) · 루트 정리 · 한 화면 흐름
 def test_onestop():
-    print("[8/10] 원스톱 실행기(run.bat) · 루트 정리 · 웹 한 화면 흐름 검증")
+    print("[8/11] 원스톱 실행기(run.bat) · 루트 정리 · 웹 한 화면 흐름 검증")
     root = ROOT
     run_bat = root / "run.bat"
     run_sh = root / "run.sh"
@@ -1482,7 +1483,7 @@ def test_onestop():
 
 
 def test_logout():
-    print("[9/10] 카카오 로그아웃 검증 (세션 파일 삭제 · CLI · 웹)")
+    print("[9/11] 카카오 로그아웃 검증 (세션 파일 삭제 · CLI · 웹)")
     import web_ui
 
     prof = ROOT / "logs" / "_logout_profile"
@@ -1637,7 +1638,7 @@ class StrictNotionStub:
 
 
 def test_column_discovery():
-    print("[10/10] 담당자 열 목록 — 주소 정규화 · 토큰만으로 DB 자동 찾기 · 폴백 · 새로고침 검증")
+    print("[10/11] 담당자 열 목록 — 주소 정규화 · 토큰만으로 DB 자동 찾기 · 폴백 · 새로고침 검증")
     import web_ui
 
     read = lambda: (ROOT / "web_ui.py").read_text(encoding="utf-8")
@@ -1943,6 +1944,215 @@ def test_column_discovery():
         web_ui.reset_state()
 
 
+# ------------- 11부: 계정 전환 캐시 — 세션 파일 변경 · 로그아웃 · 계정 닉네임 · 이미 신청 건수
+def test_session_cache():
+    print("[11/11] 계정 전환 캐시 — 세션 파일 변경 시 새 쿠키 · 로그아웃 초기화 · 계정 닉네임 · 이미 신청 건수 검증")
+    import web_ui
+
+    statef = ROOT / "logs" / "_session_state.json"
+    prof = ROOT / "logs" / "_session_profile"
+    saved = {k: getattr(main, k) for k in ("STATE_FILE", "PROFILE_DIR", "fetch_json", "login_state",
+                                          "collect_campaigns", "collect_applied_ids")}
+
+    def write_state(token, pad=0, domain=None):
+        """카카오 세션 백업(kakao_state.json)을 다른 계정 쿠키로 다시 쓴다."""
+        dom = domain or ".kakao.com"
+        cookies = [
+            {"name": "_kau", "value": token, "domain": dom, "path": "/"},
+            {"name": "gift_session", "value": token, "domain": domain or "gift.kakao.com", "path": "/"},
+        ]
+        if pad:
+            cookies.append({"name": "pad", "value": "x" * pad, "domain": ".kakao.com", "path": "/"})
+        statef.write_text(json.dumps({"cookies": cookies}, ensure_ascii=False), encoding="utf-8")
+
+    def jar_of(opener):
+        for h in (getattr(opener, "handlers", []) or []):
+            jar = getattr(h, "cookiejar", None)
+            if jar is not None:
+                return {c.name: c.value for c in jar}
+        return {}
+
+    main.STATE_FILE = str(statef)
+    main.PROFILE_DIR = str(prof)
+    main.reset_session_cache()
+    try:
+        # 1) 첫 계정 쿠키로 요청기 생성 — 같은 파일이면 그대로 재사용
+        write_state("account-A")
+        op1 = main._session_opener()
+        check("세션 요청기: 저장된 세션으로 생성", op1 is not None and jar_of(op1).get("_kau") == "account-A",
+              str(jar_of(op1) if op1 else None))
+        check("세션 요청기: 세션 파일이 그대로면 재사용", main._session_opener() is op1)
+
+        # 2) 로그아웃 후 다른 계정 로그인(kakao_state.json 다시 씀) → 새 쿠키여야 한다
+        write_state("account-B", pad=7)
+        op2 = main._session_opener()
+        check("세션 요청기: 세션 파일이 바뀌면 새로 생성", op2 is not op1)
+        check("세션 요청기: 새 계정 쿠키를 쓴다(이전 계정 이력이 남지 않음)",
+              jar_of(op2).get("_kau") == "account-B", str(jar_of(op2)))
+
+        # 3) 세션 파일 삭제(로그아웃) → 세션 없음
+        statef.unlink(missing_ok=True)
+        check("세션 요청기: 세션 파일이 지워지면 None", main._session_opener() is None)
+
+        # 4) 파일 재생성 → 새 쿠키
+        write_state("account-C")
+        op3 = main._session_opener()
+        check("세션 요청기: 세션 파일이 다시 생기면 새 쿠키",
+              op3 is not None and op3 is not op2 and jar_of(op3).get("_kau") == "account-C",
+              str(jar_of(op3) if op3 else None))
+
+        # 5) logout() 이 캐시를 즉시 비운다(파일 삭제 + 요청기 초기화)
+        res = main.logout(quiet=True)
+        check("로그아웃: 요청기·계정 캐시 즉시 초기화",
+              res["ok"] and main._SESSION_OPENER is None and main._SESSION_OPENER_SIG is None
+              and main._session_opener() is None, str(res)[:160])
+
+        # 5-2) 실제 버그 재현: 오래 사는 프로세스에서 계정을 바꿔도 이전 계정 이력이 남지 않는다
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        seen_cookies = []
+
+        class HistoryHandler(BaseHTTPRequestHandler):
+            """신청 이력 API 흉내 — 쿠키(_kau)에 따라 다른 계정의 이력을 돌려준다."""
+
+            def log_message(self, *a):
+                return
+
+            def do_GET(self):
+                raw = self.headers.get("Cookie") or ""
+                token = ""
+                for part in raw.split(";"):
+                    k, _, v = part.strip().partition("=")
+                    if k == "_kau":
+                        token = v
+                seen_cookies.append(token)
+                if token == "account-A":
+                    body = {"contents": [{"campaignId": "A-1"}, {"campaignId": "A-2"}], "isLast": True}
+                    code = 200
+                elif token == "account-B":
+                    body = {"contents": [{"campaignId": "B-1"}], "isLast": True}
+                    code = 200
+                else:
+                    body, code = {"errorMessage": "unauthorized"}, 401
+                data = json.dumps(body).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), HistoryHandler)
+        th = threading.Thread(target=httpd.serve_forever, daemon=True)
+        th.start()
+        saved_history = main.HISTORY_API
+        try:
+            main.HISTORY_API = (f"http://127.0.0.1:{httpd.server_address[1]}"
+                                "/a/partner-trial/api/v1/trial-campaigns/apply")
+            write_state("account-A", domain="127.0.0.1")
+            main.reset_session_cache()
+            ids_a = main.collect_applied_ids()
+            write_state("account-B", pad=7, domain="127.0.0.1")   # 로그아웃 → 다른 계정 로그인
+            ids_b = main.collect_applied_ids()
+            check("실제 버그 재현: 계정 전환 뒤 이전 계정 이력이 남지 않는다",
+                  ids_a == {"A-1", "A-2"} and ids_b == {"B-1"}, f"{ids_a} → {ids_b} ({seen_cookies})")
+            statef.unlink(missing_ok=True)            # 로그아웃
+            ids_none = main.collect_applied_ids()
+            check("계정 전환: 로그아웃 상태에서는 이력 없음(401 → None)",
+                  ids_none is None and seen_cookies[-1] == "", f"{ids_none} / {seen_cookies}")
+        finally:
+            main.HISTORY_API = saved_history
+            httpd.shutdown()
+            httpd.server_close()
+            th.join(timeout=3)
+
+        # 6) 계정 정보(닉네임) — gift 헤더 API 응답을 가짜로
+        current = {"nick": "서브.연"}
+        calls = []
+
+        def fake_fetch(url, timeout=20, use_session=False):
+            calls.append((url, use_session))
+            if "/a/v1/header" in url:
+                if current["nick"] is None:
+                    return 200, {}, None
+                return 200, {"user": {"nickname": current["nick"], "id": 123456789}, "cartInfo": {"count": 0}}, None
+            if "/trial-campaigns/apply" in url:
+                return 200, {"contents": [], "isLast": True}, None
+            return 200, {}, None
+
+        main.fetch_json = fake_fetch
+        write_state("account-A")
+        main.reset_session_cache()
+        acc = main.fetch_account()
+        check("계정 정보: /a/v1/header 로 닉네임을 읽는다",
+              bool(acc) and acc.get("nickname") == "서브.연" and acc.get("source") == main.USER_INFO_API, str(acc))
+        check("계정 정보: 식별자는 가려서(ID …6789) 보여 준다",
+              bool(acc) and acc.get("masked_key") == "ID …6789", str(acc))
+        n_before = len(calls)
+        again = main.fetch_account()
+        check("계정 정보: 같은 세션이면 다시 부르지 않는다(60초 캐시)", len(calls) == n_before and again == acc,
+              f"calls={len(calls) - n_before}")
+
+        current["nick"] = "서브.오"
+        write_state("account-B", pad=7)      # 다른 계정으로 로그인한 상황
+        acc2 = main.fetch_account()
+        check("계정 정보: 계정을 바꾸면 새 닉네임으로 다시 읽는다",
+              bool(acc2) and acc2.get("nickname") == "서브.오" and len(calls) == n_before + 1, str(acc2))
+
+        # 7) 로그인 상태에 닉네임이 함께 온다
+        st = main.login_state()
+        check("로그인 상태: 닉네임을 함께 돌려준다",
+              st.get("state") == "ok" and st.get("nickname") == "서브.오" and "서브.오" in (st.get("detail") or ""),
+              str(st))
+
+        # 8) 닉네임을 못 읽어도 로그인 상태는 유지(오탐으로 '로그아웃' 표시하지 않음)
+        current["nick"] = None
+        main.reset_session_cache()
+        st2 = main.login_state()
+        check("로그인 상태: 닉네임을 못 읽어도 '로그인됨' 유지",
+              st2.get("state") == "ok" and st2.get("nickname") is None, str(st2))
+
+        # 9) 웹 조종판: 상태에 닉네임이 실리고 배지에 '로그인됨 · 닉네임'
+        current["nick"] = "서브.오"
+        main.reset_session_cache()
+        web_ui.reset_state()
+        web_ui.STATE["login"] = main.login_state()
+        payload = web_ui.api_status()["login"]
+        check("웹 상태: 로그인 계정 닉네임을 화면에 전달", payload.get("nickname") == "서브.오", str(payload))
+        check("웹 화면: 배지에 '로그인됨 · 닉네임'",
+              "로그인됨 · " in web_ui.PAGE_HTML and "login.nickname" in web_ui.PAGE_HTML)
+        web_ui.reset_state()
+
+        # 10) 미리보기: 이미 신청 N건을 요약에 명시
+        main.login_state = saved["login_state"]
+        items = [build_item("수플린 설향딸기 800g", [(93, "식품", 203, "과일·견과")]),
+                 build_item("스누피 3단 전기요", [(97, "디지털·가전", 163, "계절가전")]),
+                 build_item("무드웨어 블러 립스틱", [(95, "뷰티", 181, "메이크업")])]
+        main.collect_campaigns = lambda max_pages: list(items)
+        main.collect_applied_ids = lambda: {"id-수플린 설향", "id-지난상품"}
+        r = web_ui.preview(mode="list", limit=10)
+        check("미리보기: 이미 신청 건수를 따로 돌려준다",
+              r.get("ok") and r.get("applied_count") == 2 and r.get("applied_in_list") == 1,
+              str({k: r.get(k) for k in ("applied_count", "applied_in_list")}))
+        check("미리보기: 요약에 '이미 신청 1건 포함'", "이미 신청 1건 포함" in (r.get("summary") or ""),
+              str(r.get("summary")))
+        check("미리보기: 이미 신청한 상품은 대상에서 빠진다",
+              all(it["campaignId"] != "id-수플린 설향" for it in r.get("items") or []), str(r.get("items"))[:200])
+
+        # 11) 로그인 전(이력 확인 불가)이면 그 사실을 숨기지 않는다
+        main.collect_applied_ids = lambda: None
+        r2 = web_ui.preview(mode="list", limit=10)
+        check("미리보기: 이력 확인 불가를 요약에 표시",
+              r2.get("applied_count") is None and "신청 이력 확인 불가" in (r2.get("summary") or ""),
+              str(r2.get("summary")))
+    finally:
+        for k, v in saved.items():
+            setattr(main, k, v)
+        main.reset_session_cache()
+        web_ui.reset_state()
+        statef.unlink(missing_ok=True)
+        shutil.rmtree(prof, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_filter()
     test_apply_flow()
@@ -1954,6 +2164,7 @@ if __name__ == "__main__":
     test_onestop()
     test_logout()
     test_column_discovery()
+    test_session_cache()
     cleanup()
     print()
     if FAILS:

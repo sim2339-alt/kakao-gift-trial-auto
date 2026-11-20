@@ -77,6 +77,13 @@ DESKTOP_VIEWPORT = {"width": 1280, "height": 900}
 AUTH_WEB = "https://shopping-userauth-web.kakao.com"
 GIFT_WEB_LOGIN = BASE + "/a/v1/web/login"
 LOGIN_TARGET = BASE + "/giftbox/trial-campaign"
+# 로그인한 계정 정보(닉네임)를 돌려주는 gift 화면 "헤더" API.
+#   gift.kakao.com 화면이 상단 헤더(닉네임·장바구니 수)를 그릴 때 withCredentials(세션 쿠키)로 부르는 주소 그대로다.
+#   로그인 전에는 서버가 {} 를, 로그인 세션이 있으면 {"user": {"nickname": "…"}, …} 를 돌려준다.
+#   (번들 chunk-L6SSRCUH.js 실측: nickname$ = header 응답의 user?.nickname)
+USER_INFO_API = BASE + "/a/v1/header"
+# 같은 세션이면 이 시간 동안은 헤더 API 를 다시 부르지 않는다(화면이 5초마다 상태를 새로 그리므로).
+USER_INFO_CACHE_SECONDS = 60
 # 로그인 세션 백업(storage_state) — .gitignore 에 등록되어 있음
 STATE_FILE = "kakao_state.json"
 LOGIN_WAIT_SECONDS = 180
@@ -163,12 +170,19 @@ def load_filter() -> dict:
 # ---------------------------------------------------------------------------
 # 2. HTTP (표준 라이브러리만 사용 → 설치 실패 요인 최소화)
 # ---------------------------------------------------------------------------
-_SESSION_OPENER = None  # 저장된 세션 쿠키를 붙인 요청기(1회만 생성)
+_SESSION_OPENER = None  # 저장된 세션 쿠키를 붙인 요청기(세션 파일이 바뀌면 다시 생성)
+_SESSION_OPENER_SIG = None   # 위 요청기를 만들 때의 세션 파일 지문((exists, mtime_ns, size))
+# 마지막으로 읽은 계정 정보(닉네임) — {"sig": 세션 파일 지문, "at": 읽은 시각, "value": dict|None}
+_USER_CACHE: dict = {"sig": None, "at": 0.0, "value": None}
 
 
-def _load_state_cookies(path: str = STATE_FILE) -> list:
-    """kakao_state.json(storage_state)에서 쿠키 목록만 꺼낸다. 값은 절대 출력하지 않는다."""
-    p = Path(path)
+def _load_state_cookies(path: str | None = None) -> list:
+    """kakao_state.json(storage_state)에서 쿠키 목록만 꺼낸다. 값은 절대 출력하지 않는다.
+
+    path 를 주지 않으면 지금 시점의 STATE_FILE 을 읽는다(기본 인자에 경로를 묶어 두면
+    STATE_FILE 을 바꿔도 옛 경로를 계속 보게 되므로 함수 안에서 해석한다).
+    """
+    p = Path(path or STATE_FILE)
     if not p.exists():
         return []
     try:
@@ -201,12 +215,37 @@ def _cookie_jar(cookies: list | None = None) -> http.cookiejar.CookieJar:
     return jar
 
 
+def _state_file_signature(path: str | None = None) -> tuple:
+    """세션 파일의 지문 (존재, mtime_ns, 크기).
+
+    웹 조종판(web_ui.py)은 오래 살아 있는 프로세스라, 로그아웃/다른 계정 로그인으로
+    kakao_state.json 이 지워지거나 다시 만들어져도 예전 쿠키를 계속 쓰면 안 된다.
+    이 지문이 달라지면 _session_opener() 가 새 CookieJar 를 만든다.
+    """
+    try:
+        st = Path(path or STATE_FILE).stat()
+        return (True, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (False, 0, 0)
+
+
+def reset_session_cache():
+    """세션 쿠키 요청기·계정 정보 캐시를 버린다(로그아웃/계정 전환 직후)."""
+    global _SESSION_OPENER, _SESSION_OPENER_SIG
+    _SESSION_OPENER = None
+    _SESSION_OPENER_SIG = None
+    _USER_CACHE.update({"sig": None, "at": 0.0, "value": None})
+
+
 def _session_opener():
-    global _SESSION_OPENER
-    if _SESSION_OPENER is None:
+    """저장된 세션 쿠키를 붙인 요청기. 세션 파일(존재·mtime·크기)이 바뀌면 새로 만든다."""
+    global _SESSION_OPENER, _SESSION_OPENER_SIG
+    sig = _state_file_signature()
+    if _SESSION_OPENER is None or sig != _SESSION_OPENER_SIG:
         jar = _cookie_jar()
         _SESSION_OPENER = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(jar)) if len(jar) else False
+        _SESSION_OPENER_SIG = sig
     return _SESSION_OPENER or None
 
 
@@ -308,20 +347,73 @@ def stop_requested() -> bool:
     return bool(_STOP["flag"])
 
 
-def login_state() -> dict:
-    """저장된 세션으로 신청 이력 API 를 한 번 호출해 로그인 상태만 본다(브라우저 없이).
+def _mask_user_key(key: str | None) -> str | None:
+    """계정 식별자를 화면에 보여 줄 수 있게 가린다(끝 4자리만). 값 자체는 저장·출력하지 않는다."""
+    if not key:
+        return None
+    tail = str(key)[-4:]
+    return f"ID …{tail}" if len(str(key)) > 4 else "ID …"
 
-    반환: {"state": "ok"|"none"|"unknown", "detail": 사람이 읽을 안내}
+
+def fetch_account(timeout: int = 15, max_age: float | None = None) -> dict | None:
+    """지금 세션 쿠키로 gift 헤더 API(/a/v1/header)를 불러 로그인 계정(닉네임)을 읽는다.
+
+    반환: None(세션 없음·읽기 실패) 또는
+          {"nickname": str|None, "masked_key": str|None, "source": "/a/v1/header"}
+    닉네임이 비어 있으면 masked_key 만으로도 계정이 바뀌었는지 알아볼 수 있다.
+    """
+    if max_age is None:
+        max_age = USER_INFO_CACHE_SECONDS
+    if not _load_state_cookies():
+        return None
+    sig = _state_file_signature()
+    now = time.time()
+    if _USER_CACHE.get("sig") == sig and (now - float(_USER_CACHE.get("at") or 0)) < max_age:
+        value = _USER_CACHE.get("value")
+        return dict(value) if value else None
+
+    status, data, _err = fetch_json(USER_INFO_API, timeout=timeout, use_session=True)
+    account = None
+    if status == 200 and isinstance(data, dict):
+        user = data.get("user") if isinstance(data.get("user"), dict) else None
+        if user:
+            nickname = str(user.get("nickname") or "").strip() or None
+            key = None
+            for name in ("id", "userId", "userNo", "userKey", "memberId",
+                         "serviceUserId", "kakaoUserId", "uuid"):
+                if user.get(name) not in (None, ""):
+                    key = str(user.get(name))
+                    break
+            account = {"nickname": nickname, "masked_key": _mask_user_key(key),
+                       "source": USER_INFO_API}
+    _USER_CACHE.update({"sig": sig, "at": now, "value": account})
+    return dict(account) if account else None
+
+
+def login_state() -> dict:
+    """저장된 세션으로 신청 이력 API 를 한 번 호출해 로그인 상태를 보고, 계정 닉네임도 함께 읽는다.
+
+    반환: {"state": "ok"|"none"|"unknown", "detail": 사람이 읽을 안내,
+           "nickname": str|None, "account": {"nickname", "masked_key"}|None}
     """
     if not _load_state_cookies():
-        return {"state": "none",
+        return {"state": "none", "nickname": None, "account": None,
                 "detail": "저장된 세션이 없습니다. [로그인 창 열기]로 한 번 로그인해 주세요."}
     status, _data, err = fetch_json(f"{HISTORY_API}?page=0&size=1", use_session=True)
     if status == 200:
-        return {"state": "ok", "detail": "신청 이력 API 200 — 로그인 유지 중"}
+        account = fetch_account()
+        nickname = (account or {}).get("nickname")
+        detail = "신청 이력 API 200 — 로그인 유지 중"
+        if nickname:
+            detail += f" · 계정: {nickname}"
+        elif account:
+            detail += " · 계정 이름은 확인하지 못했습니다"
+        return {"state": "ok", "detail": detail, "nickname": nickname, "account": account}
     if status == 401:
-        return {"state": "none", "detail": "세션이 만료됐습니다(401). [로그인 창 열기]로 다시 로그인해 주세요."}
-    return {"state": "unknown", "detail": f"확인 실패(HTTP {status} {str(err or '')[:60]})"}
+        return {"state": "none", "nickname": None, "account": None,
+                "detail": "세션이 만료됐습니다(401). [로그인 창 열기]로 다시 로그인해 주세요."}
+    return {"state": "unknown", "nickname": None, "account": None,
+            "detail": f"확인 실패(HTTP {status} {str(err or '')[:60]})"}
 
 
 def logout(profile_dir: str | None = None, state_file: str | None = None,
@@ -338,6 +430,8 @@ def logout(profile_dir: str | None = None, state_file: str | None = None,
 
     pf = Path(profile_dir or PROFILE_DIR)
     sf = Path(state_file or STATE_FILE)
+    # 이 프로세스에 캐시된 세션 쿠키·계정 정보를 먼저 버린다(로그아웃 뒤 다른 계정으로 전환).
+    reset_session_cache()
     removed, failed = [], []
     cookies = 0
     try:
@@ -358,6 +452,9 @@ def logout(profile_dir: str | None = None, state_file: str | None = None,
             removed.append(pf.name + "/")
         except Exception as exc:
             failed.append(f"{pf.name}/({type(exc).__name__})")
+
+    # 지운 뒤에도 한 번 더 비운다(지우기 직전에 잡혀 있던 쿠키로 다시 만들지 않도록).
+    reset_session_cache()
 
     ok = not failed
     if ok:
