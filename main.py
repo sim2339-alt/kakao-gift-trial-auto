@@ -833,13 +833,22 @@ def apply_url(cid: str, detail: dict | None) -> tuple:
 
 
 def _wish_state(page, product_id) -> bool | None:
-    """위시 담김 여부(친구 공개 기준). 확인 못 하면 None."""
+    """위시 담김 여부(친구 공개 기준). 판단할 수 없으면 None.
+
+    실측 응답(2026-11-20): 담기 전 {"wished": false, "wishCount": 6069}
+    → wished 가 참일 때만 visibleTo("others"|"me")가 붙는다.
+    """
     if not product_id:
         return None
     data, _ = _json_get(page, WISH_STATE_API.format(pid=product_id), DETAIL_PAGE.format(cid=""))
     if not isinstance(data, dict):
         return None
-    return data.get("wished") is True and (data.get("visibleTo") or "") == "others"
+    if data.get("wished") is not True:
+        return False
+    visible = data.get("visibleTo")
+    if visible is None:
+        return None  # 공개 범위를 응답에서 확인 못함 → 성공/실패 단정하지 않는다
+    return visible == "others"
 
 
 def _ensure_wish(page, detail: dict | None, enabled: bool = True) -> str:
