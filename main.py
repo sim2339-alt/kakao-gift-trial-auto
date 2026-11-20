@@ -33,6 +33,7 @@ import json
 import os
 import random
 import re
+import shutil
 import sys
 import time
 import urllib.error
@@ -258,7 +259,7 @@ def collect_applied_ids() -> set | None:
         status, data, err = fetch_json(f"{HISTORY_API}?page={page}&size=50", use_session=True)
         if status == 401:
             print("[안내] 신청 이력 조회는 로그인이 필요합니다(저장된 세션 없음/만료).")
-            print("       run_login.bat 을 한 번 실행하면 다음부터 신청 이력까지 자동으로 걸러집니다.")
+            print("       웹 조종판의 [카카오 로그인 창 열기] 버튼(또는 scripts\run_login.bat)으로 한 번 로그인하면 다음부터 신청 이력까지 자동으로 걸러집니다.")
             return None
         if status != 200 or not isinstance(data, dict):
             print(f"[경고] 신청 이력 조회 실패 (status={status}, {err})")
@@ -309,6 +310,57 @@ def login_state() -> dict:
     if status == 401:
         return {"state": "none", "detail": "세션이 만료됐습니다(401). [로그인 창 열기]로 다시 로그인해 주세요."}
     return {"state": "unknown", "detail": f"확인 실패(HTTP {status} {str(err or '')[:60]})"}
+
+
+def logout(profile_dir: str | None = None, state_file: str | None = None,
+           quiet: bool = False) -> dict:
+    """저장된 카카오 로그인 세션을 지운다(쿠키 백업 + 브라우저 프로필).
+
+    지운 뒤에는 다음 로그인 때 다른 계정으로 로그인할 수 있다.
+    반환: {"ok": bool, "removed": [...], "failed": [...], "cookies": N, "detail": "..."}
+    프로필 폴더를 지우므로, 브라우저 창이 열려 있으면 일부 파일이 잠겨 실패할 수 있다.
+    """
+    def say(msg: str):
+        if not quiet:
+            print(msg)
+
+    pf = Path(profile_dir or PROFILE_DIR)
+    sf = Path(state_file or STATE_FILE)
+    removed, failed = [], []
+    cookies = 0
+    try:
+        cookies = len(_load_state_cookies(str(sf)))
+    except Exception:
+        cookies = 0
+
+    if sf.exists():
+        try:
+            sf.unlink()
+            removed.append(sf.name)
+        except Exception as exc:
+            failed.append(f"{sf.name}({type(exc).__name__})")
+
+    if pf.exists():
+        try:
+            shutil.rmtree(pf)
+            removed.append(pf.name + "/")
+        except Exception as exc:
+            failed.append(f"{pf.name}/({type(exc).__name__})")
+
+    ok = not failed
+    if ok:
+        detail = "로그아웃했습니다. 다음 로그인은 다른 계정으로도 할 수 있습니다."
+    else:
+        detail = ("일부 세션 파일을 지우지 못했습니다(브라우저 창이 열려 있으면 닫고 다시 시도). "
+                  f"남은 파일: {', '.join(failed)}")
+    say("")
+    if ok:
+        say(f"[완료] 로그아웃했습니다. 지운 항목: {', '.join(removed) if removed else '없음(이미 로그아웃 상태)'}"
+            f" / 저장돼 있던 쿠키 {cookies}개")
+        say("       이제 웹 조종판의 [카카오 로그인 창 열기]로 다른 계정에 로그인할 수 있습니다.")
+    else:
+        say(f"[경고] {detail}")
+    return {"ok": ok, "removed": removed, "failed": failed, "cookies": cookies, "detail": detail}
 
 
 # ---------------------------------------------------------------------------
@@ -1157,7 +1209,7 @@ def _browser_hint(exc) -> str:
     """playwright 가 내는 불친절한 오류를 사용자용 문장으로 바꾼다."""
     msg = str(exc)
     if "Executable doesn't exist" in msg or "playwright install" in msg:
-        return "브라우저(크로미움)가 설치되지 않았습니다. install.bat 을 먼저 실행해 주세요."
+        return "브라우저(크로미움)가 설치되지 않았습니다. run.bat 을 다시 실행해 주세요(자동 설치)."
     if "Host system is missing dependencies" in msg:
         return "브라우저 실행에 필요한 시스템 파일이 없습니다(리눅스: playwright install-deps)."
     return ""
@@ -1354,13 +1406,13 @@ def run_login(mode: str = "desktop") -> int:
             if status == 200:
                 print("  - [검증] 신청 화면(모바일 모드)에서도 세션 유지 확인 (HISTORY_API 200)")
             elif status == "launch_error":
-                print(f"  - [안내] 신청 화면 검증은 건너뜀(창 실행 실패: {err}). run_auto.bat 에서 확인됩니다.")
+                print(f"  - [안내] 신청 화면 검증은 건너뜀(창 실행 실패: {err}). 실제 신청(웹 조종판 [자동 신청 시작])에서 확인됩니다.")
             else:
                 print(f"  - [경고] 신청 화면(모바일 모드)에서 세션이 인식되지 않습니다"
                       f"(HTTP {status if status is not None else '없음'}{(' ' + err) if err else ''}).")
-                print("           run_login.bat 을 실행해 로그인을 다시 마쳐 주세요.")
+                print("           웹 조종판의 [카카오 로그인 창 열기](또는 scripts\run_login.bat)로 다시 로그인해 주세요.")
                 return 1
-            print("       이어서 run_dry.bat / run_auto.bat 을 실행하세요.")
+            print("       이제 run.bat 을 실행하면 웹 조종판에서 미리보기·신청을 할 수 있습니다.")
             return 0
 
         print()
@@ -1410,14 +1462,14 @@ def run_login(mode: str = "desktop") -> int:
                 if status == 200:
                     print("  - [검증] 신청 화면(모바일 모드)에서도 세션 유지 확인 (HISTORY_API 200)")
                 elif status == "launch_error":
-                    print(f"  - [안내] 신청 화면 검증은 건너뜀(창 실행 실패: {err}). run_auto.bat 에서 확인됩니다.")
+                    print(f"  - [안내] 신청 화면 검증은 건너뜀(창 실행 실패: {err}). 실제 신청(웹 조종판 [자동 신청 시작])에서 확인됩니다.")
                 else:
                     print(f"  - [경고] 신청 화면(모바일 모드)에서 세션이 인식되지 않습니다"
                           f"(HTTP {status if status is not None else '없음'}{(' ' + err) if err else ''}).")
                     print("           이 경우 아래 명령으로 모바일 화면에서 직접 로그인해 주세요:")
                     print("             python main.py --login-mobile")
                     return 3
-            print("  이제 run_dry.bat / run_auto.bat 을 실행하세요.")
+            print("  이제 run.bat 을 실행해 웹 조종판에서 진행하세요.")
             return 0
 
         # ---- 실패 진단 ----
@@ -1445,7 +1497,7 @@ def run_login(mode: str = "desktop") -> int:
         print("  - gift 세션은 로그인 후 gift.kakao.com/a/v1/web/login 를 거쳐야 만들어집니다.")
         print("    계정 로그인만 하고 그 화면에 머물렀다면 세션이 만들어지지 않습니다.")
         print("    위 주소가 accounts.kakao.com 이면 로그인이 끝나지 않은 상태입니다.")
-        print("    run_login.bat 을 다시 실행해 로그인을 끝까지 마쳐 주세요.")
+        print("    웹 조종판의 [카카오 로그인 창 열기](또는 scripts\run_login.bat)로 로그인을 끝까지 마쳐 주세요.")
         return 1
 
 
@@ -1916,7 +1968,7 @@ def run_apply(candidates: list, args) -> int:
             print(f"       (핵심: gift.kakao.com {_domain_count(summary, 'gift.kakao.com')}개 / "
                   f"kakao.com {_domain_count(summary, 'kakao.com')}개 / "
                   f"shopping-userauth-web.kakao.com {_domain_count(summary, 'shopping-userauth-web.kakao.com')}개)")
-            print("       먼저 run_login.bat(데스크톱 로그인 창)을 실행해 로그인을 끝까지 마쳤 주세요.")
+            print("       먼저 웹 조종판의 [카카오 로그인 창 열기](또는 scripts\run_login.bat)로 로그인을 끝까지 마쳐 주세요.")
             print("       (체험단 화면에서 뜨는 '카카오 계정으로 로그인하기'로는 gift 세션이 만들어지지 않습니다.)")
             return 2
 
@@ -1931,7 +1983,7 @@ def run_apply(candidates: list, args) -> int:
                                pre_submit_delay=(args.delay_min, args.delay_max))
             except LoginRequired:
                 print("로그인 필요 → 중단")
-                print("[중단] 로그인이 풀렸습니다. run_login.bat(데스크톱 로그인 창)으로 다시 로그인한 뒤 재실행하세요.")
+                print("[중단] 로그인이 풀렸습니다. 웹 조종판의 [카카오 로그인 창 열기]로 다시 로그인한 뒤 재실행하세요.")
                 break
             results.append(res)
             print(f"{res['status']} ({res['reason'][:80]})")
@@ -1983,6 +2035,8 @@ def main(argv=None) -> int:
     ap.add_argument("--login", action="store_true", help="최초 1회 카카오 로그인 후 세션 저장")
     ap.add_argument("--login-mobile", action="store_true",
                     help="--login 과 함께: 모바일(iPhone) 화면에서 로그인 (데스크톱 로그인으로 세션이 안 잡힐 때)")
+    ap.add_argument("--logout", action="store_true",
+                    help="저장된 카카오 로그인 세션을 지운다(다른 계정으로 다시 로그인할 수 있게)")
     ap.add_argument("--dry-run", action="store_true", help="실제 신청 없이 후보 목록만 출력")
     ap.add_argument("--limit", type=_limit_arg, default=None,
                     help=f"실제 신청할 최대 개수 — 0 또는 all/전체 = 제한 없이 전부 "
@@ -2007,13 +2061,16 @@ def main(argv=None) -> int:
     ap.add_argument("--notion-column", dest="notion_column", default=None,
                     help=f"노션 참가자 열 이름 (기본: notion_secret.json 의 column, 없으면 '{NOTION_DEFAULT_COLUMN}')")
     ap.add_argument("--ask-column", dest="ask_column", action="store_true",
-                    help="실행 전에 '어느 담당자 열에 기록할지'만 묻는다 (기본값 = 직전에 고른 열 · run_auto.bat 이 사용)")
+                    help="실행 전에 '어느 담당자 열에 기록할지'만 묻는다 (기본값 = 직전에 고른 열 · scripts\run_auto.bat 이 사용)")
     ap.add_argument("--setup-notion", dest="setup_notion", action="store_true",
                     help="노션 연동 설정(notion_secret.json)을 대화형으로 만들고 종료")
     ap.add_argument("--no-notion", dest="no_notion", action="store_true",
                     help="노션 기록을 끄고 CSV 만 저장")
     args = ap.parse_args(argv)
     reset_stop()      # 새 실행 — 이전 중단 요청을 지운다
+
+    if args.logout:
+        return 0 if logout().get("ok") else 1
 
     if args.setup_notion:
         return 0 if setup_notion() else 1
@@ -2022,7 +2079,7 @@ def main(argv=None) -> int:
         args.delay_min, args.delay_max = args.delay_max, args.delay_min
 
     # ── 실행 모드/개수: 인자를 주면 그대로, 안 주면 대화형으로 물어본다(배치·자동화는 인자로).
-    interactive = (not (args.login or args.login_mobile or args.dry_run)) and sys.stdin.isatty()
+    interactive = (not (args.login or args.login_mobile or args.dry_run or args.logout)) and sys.stdin.isatty()
     limit_given = args.limit is not None   # 개수를 안 주면 대화형 마법사(모드→개수→담당자 열)
     mode = "notion" if args.notion_pending else "list"
     if args.limit is None:
@@ -2043,7 +2100,7 @@ def main(argv=None) -> int:
         try:
             return run_login("mobile" if args.login_mobile else "desktop")
         except ImportError:
-            print("[오류] playwright 가 설치되지 않았습니다. install.bat 을 먼저 실행하세요.")
+            print("[오류] playwright 가 설치되지 않았습니다. run.bat 을 다시 실행해 주세요(자동 설치).")
             return 1
         except Exception as exc:
             hint = _browser_hint(exc)
@@ -2128,7 +2185,7 @@ def main(argv=None) -> int:
         if nstat["applied_checked"]:
             print(f"       이미 신청한 건 {nstat['applied']}건 제외")
         else:
-            print("       (신청 이력을 확인하지 못했습니다 — run_login.bat 으로 로그인하면 이미 신청한 건도 걸러집니다)")
+            print("       (신청 이력을 확인하지 못했습니다 — 웹 조종판 [카카오 로그인 창 열기]로 로그인하면 이미 신청한 건도 걸러집니다)")
         if nstat["dup"]:
             print(f"       같은 캠페인이 여러 행에 있어 1건으로 합침 {nstat['dup']}행")
         if args.notion_all:
@@ -2151,7 +2208,7 @@ def main(argv=None) -> int:
             path = save_candidates_csv(candidates, args.limit, held)
             print(f"후보 목록 저장: {path.resolve()}")
         print("\n※ dry-run 모드입니다. 실제 신청은 하나도 하지 않았습니다.")
-        print("※ 실제 신청: run_auto.bat (또는 python main.py --limit 100 / --limit 0 = 전체)")
+        print("※ 실제 신청: run.bat → 웹 조종판 [자동 신청 시작] (또는 python main.py --limit 100 / --limit 0 = 전체)")
         return 0
 
     if held and not args.include_unknown:
@@ -2160,7 +2217,7 @@ def main(argv=None) -> int:
     try:
         return run_apply(candidates, args)
     except ImportError:
-        print("[오류] playwright 가 설치되지 않았습니다. install.bat 을 먼저 실행하세요.")
+        print("[오류] playwright 가 설치되지 않았습니다. run.bat 을 다시 실행해 주세요(자동 설치).")
         return 1
     except Exception as exc:
         hint = _browser_hint(exc)

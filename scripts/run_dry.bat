@@ -1,12 +1,12 @@
 @echo off
 chcp 65001 >nul
-cd /d "%~dp0"
+cd /d "%~dp0.."
 
 set PY=
 py -3 --version >nul 2>&1 && set PY=py -3
 if "%PY%"=="" (python --version >nul 2>&1 && set PY=python)
 if "%PY%"=="" (
-  echo [오류] 파이썬을 찾지 못했습니다. install.bat 을 먼저 실행해 주세요.
+  echo [오류] 파이썬을 찾지 못했습니다. run.bat 을 먼저 실행해 주세요(자동 설치).
   pause
   exit /b 1
 )

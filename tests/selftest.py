@@ -9,6 +9,8 @@
 - 2부: Playwright 페이지를 가짜 객체로 바꿔 신청 플로우(성공/이미신청/버튼없음/로그인필요) 검증
 - 6부: 웹 조종판(web_ui.py) API·실행/중단·토큰 미노출 검증
 - 7부: 노션 API 설정 1회 저장 → 이후 실행은 담당자 열만 선택(토큰·DB ID 재질문 없음) 검증
+- 8부: 원스톱 실행기(run.bat)와 루트 정리, 웹 조종판 한 화면 흐름 검증
+- 9부: 카카오 로그아웃(세션 파일 삭제 → 다른 계정 로그인) — CLI·웹 검증
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 import contextlib
 import io
@@ -81,7 +84,7 @@ def build_item(title, cats):
 
 
 def test_filter():
-    print("[1/7] 필터 검증")
+    print("[1/9] 필터 검증")
     flt = main.load_filter()
     cases = {
         "수플린 설향딸기 800g": "allow",
@@ -344,7 +347,7 @@ class FakePage:
 
 
 def test_apply_flow():
-    print("[2/7] 신청 플로우 검증 (가짜 브라우저)")
+    print("[2/9] 신청 플로우 검증 (가짜 브라우저)")
     campaign = {
         "campaignId": "abc",
         "campaignTitle": "테스트 상품",
@@ -599,7 +602,7 @@ class use_input:
 
 
 def test_notion():
-    print("[4/7] 노션 기록·설정·실행 모드 검증 (가짜 노션 API)")
+    print("[4/9] 노션 기록·설정·실행 모드 검증 (가짜 노션 API)")
     NOW = datetime(2026, 11, 20, 11, 0, 0)
     CFG = {"token": "ntn_dummy", "db_id": "db-dummy", "column": "메인.엽", "file": "notion_secret.json"}
     item = {
@@ -851,7 +854,7 @@ class FakeStdin:
 
 
 def test_main_modes():
-    print("[5/7] 실행 모드 통합 검증 (main() — 네트워크·브라우저 없이)")
+    print("[5/9] 실행 모드 통합 검증 (main() — 네트워크·브라우저 없이)")
     main.notion_list_columns = lambda db, tok, transport=None: ["메인.엽", "서브.동"]
     items = [
         build_item("스누피 3단 전기요", [(97, "디지털·가전", 163, "계절가전")]),
@@ -973,7 +976,7 @@ def cleanup():
 
 # --------------------------------------------- 6부: 웹 조종판(web_ui) 검증
 def test_web():
-    print("[6/7] 웹 조종판 API 검증 (가짜 카카오·노션, 실제 HTTP 서버)")
+    print("[6/9] 웹 조종판 API 검증 (가짜 카카오·노션, 실제 HTTP 서버)")
     import web_ui
 
     web_ui.reset_state()
@@ -1164,7 +1167,7 @@ def test_web():
 
 
 def test_login_logic():
-    print("[3/7] 로그인 로직 검증 (네트워크 없이)")
+    print("[3/9] 로그인 로직 검증 (네트워크 없이)")
     url = main._login_url()
     check("로그인 주소가 웹 로그인 입구(shopping-userauth-web)인가",
           url.startswith("https://shopping-userauth-web.kakao.com/login?channel=GIFT&redirect_url="), url[:80])
@@ -1235,7 +1238,7 @@ def test_login_logic():
 
 # --------------------- 7부: 노션 1회 저장 · 담당자 열만 선택(다시 묻지 않음)
 def test_notion_once():
-    print("[7/7] 노션 1회 저장 · 담당자 열만 선택 검증 (가짜 노션 API)")
+    print("[7/9] 노션 1회 저장 · 담당자 열만 선택 검증 (가짜 노션 API)")
     tmp = ROOT / "logs" / "_once_notion_secret.json"
     tmp.parent.mkdir(exist_ok=True)
     tmp.write_text(json.dumps({"enabled": True, "token": "ntn_saved_once", "db_id": "db-once",
@@ -1415,6 +1418,162 @@ def test_notion_once():
         tmp.unlink(missing_ok=True)
 
 
+# ------------------------------- 8부: 원스톱 실행(run.bat) · 루트 정리 · 한 화면 흐름
+def test_onestop():
+    print("[8/9] 원스톱 실행기(run.bat) · 루트 정리 · 웹 한 화면 흐름 검증")
+    root = ROOT
+    run_bat = root / "run.bat"
+    run_sh = root / "run.sh"
+    legacy = ["install.bat", "install.sh", "run_auto.bat", "run_auto.sh", "run_login.bat",
+              "run_login.sh", "run_dry.bat", "run_dry.sh", "run_web.bat", "run_web.sh"]
+
+    # 1) 루트에는 실행기 하나만
+    check("원스톱: 루트에 run.bat 이 있다", run_bat.is_file())
+    check("원스톱: 맥·리눅스용 run.sh 도 같이 제공", run_sh.is_file())
+    check("원스톱: 루트에 예전 실행 파일이 남아 있지 않다",
+          not [n for n in legacy if (root / n).exists()],
+          str([n for n in legacy if (root / n).exists()]))
+    check("원스톱: 예전 실행 파일은 scripts/ 로 이동",
+          all((root / "scripts" / n).is_file() for n in legacy),
+          str([n for n in legacy if not (root / "scripts" / n).is_file()]))
+
+    # 2) run.bat 이 설치까지 자동으로 처리하고 웹 조종판을 띄우는가
+    bat = run_bat.read_text(encoding="utf-8", errors="replace")
+    check("run.bat: 웹 조종판을 실행", "web_ui.py" in bat, "")
+    check("run.bat: 필요한 패키지 자동 설치", "pip install -r requirements.txt" in bat, "")
+    check("run.bat: 브라우저(크로미움) 자동 설치", "playwright install chromium" in bat, "")
+    check("run.bat: 이미 설치됐으면 설치를 건너뛴다", bat.count("if errorlevel 1 goto") >= 1
+          and "import playwright" in bat, "")
+    check("run.bat: 파이썬이 없으면 안내", "python.org/downloads" in bat and ":NOPY" in bat, "")
+    check("run.bat: 프로젝트 루트에서 실행", 'cd /d "%~dp0"' in bat and "%~dp0.." not in bat, "")
+    check("run.bat: 윈도우용 CRLF 줄바꿈", b"\r\n" in run_bat.read_bytes(),
+          str(run_bat.read_bytes()[:20]))
+    check("run.bat: 설치·실행 실패 시 안내 후 멈춤", ":FAIL" in bat and "pause" in bat, "")
+
+    # 3) scripts/ 안의 예전 실행 파일도 그대로 동작하게(상위 폴더로 이동)
+    for name in [n for n in legacy if n.endswith(".bat")]:
+        text = (root / "scripts" / name).read_text(encoding="utf-8", errors="replace")
+        check(f"scripts/{name}: 상위 폴더(프로젝트 루트)에서 실행", 'cd /d "%~dp0.."' in text, text[:40])
+    for name in [n for n in legacy if n.endswith(".sh")]:
+        text = (root / "scripts" / name).read_text(encoding="utf-8", errors="replace")
+        check(f"scripts/{name}: 상위 폴더(프로젝트 루트)에서 실행", '$(dirname "$0")/..' in text,
+              text.splitlines()[2] if len(text.splitlines()) > 2 else "")
+
+    # 4) 웹 조종판 한 화면 흐름: 로그인·담당자 열·미리보기·자동 신청 시작
+    import web_ui
+    html = web_ui.PAGE_HTML
+    for label in ("카카오 로그인 창 열기", "로그인 확인", "담당자 열", "후보 목록 불러오기",
+                  "자동 신청 시작", "중단", "설정 변경"):
+        check(f"웹 한 화면: '{label}' 있음", label in html, "")
+    check("웹 한 화면: 진행 순서 안내", "한 화면에서 끝납니다" in html, "")
+    check("웹 한 화면: 로그인 → 열 → 미리보기 → 신청 순서대로 배치",
+          html.index('id="btnLogin"') < html.index('id="column"')
+          < html.index('id="btnPreview"') < html.index('id="btnStart"'), "")
+    check("웹 한 화면: 노션 토큰·DB ID 는 접힘 메뉴에만",
+          html.index('id="notionAdmin"') < html.index('id="tokenNew"'), "")
+    check("웹 한 화면: 예전 [열 저장] 버튼 없음", "btnSaveColumn" not in html, "")
+
+    # 5) README 는 run.bat 하나로 안내
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    check("README: run.bat 을 첫 실행 안내로 사용", "run.bat" in readme and "더블클릭" in readme, "")
+    check("README: 예전 실행 파일은 scripts/ 경로로 안내", "scripts\\" in readme or "scripts/" in readme, "")
+
+
+def test_logout():
+    print("[9/9] 카카오 로그아웃 검증 (세션 파일 삭제 · CLI · 웹)")
+    import web_ui
+
+    prof = ROOT / "logs" / "_logout_profile"
+    statef = ROOT / "logs" / "_logout_state.json"
+
+    def make_session():
+        shutil.rmtree(prof, ignore_errors=True)
+        (prof / "Default").mkdir(parents=True, exist_ok=True)
+        (prof / "Default" / "Cookies").write_bytes(b"dummy")
+        statef.write_text(json.dumps({"cookies": [
+            {"name": "_kau", "value": "x", "domain": ".kakao.com", "path": "/"},
+            {"name": "gift_session", "value": "y", "domain": "gift.kakao.com", "path": "/"},
+        ]}, ensure_ascii=False), encoding="utf-8")
+
+    saved = {"PROFILE_DIR": main.PROFILE_DIR, "STATE_FILE": main.STATE_FILE, "stdin": sys.stdin,
+             "login_state": main.login_state}
+    main.PROFILE_DIR = str(prof)
+    main.STATE_FILE = str(statef)
+    try:
+        # 1) logout(): 쿠키 백업 + 브라우저 프로필 삭제
+        make_session()
+        res = main.logout(quiet=True)
+        check("로그아웃: 프로필 폴더·세션 파일 삭제",
+              res["ok"] and not prof.exists() and not statef.exists(), str(res)[:160])
+        check("로그아웃: 지운 항목·저장 쿠키 수 보고",
+              res["cookies"] == 2 and len(res["removed"]) == 2 and not res["failed"], str(res)[:160])
+        res2 = main.logout(quiet=True)
+        check("로그아웃: 이미 로그아웃 상태여도 안전", res2["ok"] and res2["removed"] == [], str(res2)[:120])
+
+        # 2) CLI --logout: 묻지 않고 세션만 지운다
+        make_session()
+        sys.stdin = FakeStdin(True)
+        with use_input([]) as fake:
+            rc = main.main(["--logout"])
+        check("CLI --logout: 코드 0 · 세션 삭제",
+              rc == 0 and not prof.exists() and not statef.exists(), f"rc={rc}")
+        check("CLI --logout: 아무것도 묻지 않음", fake.prompts == [], str(fake.prompts))
+
+        # 3) 웹: 신청 중에는 거부, 아니면 즉시 로그아웃 + 상태 갱신
+        web_ui.reset_state()
+        make_session()
+        main.login_state = lambda: {"state": "ok", "detail": "테스트"}
+        web_ui.STATE["login"] = {"state": "ok", "detail": "테스트"}
+        th = threading.Thread(target=lambda: time.sleep(0.8), daemon=True)
+        web_ui.STATE["job"] = {"kind": "apply", "thread": th, "argv": []}
+        th.start()
+        r = web_ui.logout_kakao()
+        check("웹 로그아웃: 자동 신청 중이면 거부",
+              r["ok"] is False and "자동 신청" in (r["error"] or ""), str(r)[:160])
+        check("웹 로그아웃: 거부됐을 때 세션 파일 유지", prof.exists() and statef.exists())
+        th.join()
+        web_ui.STATE["job"] = None
+        r = web_ui.logout_kakao()
+        check("웹 로그아웃: 세션 삭제", r["ok"] and not prof.exists() and not statef.exists(), str(r)[:160])
+        st = web_ui.api_status()
+        check("웹 로그아웃: 화면 상태가 '로그아웃됨(로그인 필요)'",
+              st["login"]["state"] == "none" and "로그아웃" in (st["login"].get("detail") or ""),
+              str(st["login"]))
+        check("웹 로그아웃: 로그 창에 기록", any("로그아웃" in l for l in web_ui.log_payload(0)["lines"]), "")
+        check("웹 화면: [카카오 로그아웃] 버튼",
+              'id="btnLogout"' in web_ui.PAGE_HTML and "카카오 로그아웃" in web_ui.PAGE_HTML, "")
+        check("웹 API: /api/logout 라우트", '"/api/logout"' in (ROOT / "web_ui.py").read_text(encoding="utf-8"), "")
+
+        # 4) HTTP 로 실제로 눌렀을 때
+        make_session()
+        web_ui.reset_state()
+        httpd = web_ui.make_server("127.0.0.1", 0)
+        port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/api/logout",
+                                         data=b"{}", headers={"Content-Type": "application/json"},
+                                         method="POST")
+            out = json.loads(urllib.request.urlopen(req, timeout=15).read().decode("utf-8"))
+            check("웹 /api/logout: 200 · 세션 삭제",
+                  out.get("ok") is True and not prof.exists() and not statef.exists(), str(out)[:160])
+            check("웹 /api/logout: 상태 'none' 반환",
+                  (out.get("state") or {}).get("state") == "none", str(out)[:160])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=3)
+    finally:
+        main.PROFILE_DIR = saved["PROFILE_DIR"]
+        main.STATE_FILE = saved["STATE_FILE"]
+        sys.stdin = saved["stdin"]
+        shutil.rmtree(prof, ignore_errors=True)
+        statef.unlink(missing_ok=True)
+        main.login_state = saved["login_state"]
+        web_ui.reset_state()
+
+
 if __name__ == "__main__":
     test_filter()
     test_apply_flow()
@@ -1423,6 +1582,8 @@ if __name__ == "__main__":
     test_main_modes()
     test_web()
     test_notion_once()
+    test_onestop()
+    test_logout()
     cleanup()
     print()
     if FAILS:

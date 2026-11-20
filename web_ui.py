@@ -248,6 +248,32 @@ def check_login() -> dict:
     return state
 
 
+def logout_kakao() -> dict:
+    """카카오 로그아웃: 저장된 세션(쿠키 백업 + 브라우저 프로필)을 지운다.
+
+    다음에 [카카오 로그인 창 열기]로 다른 계정에도 로그인할 수 있다.
+    신청이 도는 중에는 세션이 필요하므로 거부한다.
+    """
+    if job_running():
+        return {"ok": False, "error": "자동 신청이 도는 중입니다. [중단]으로 멈춘 뒤에 로그아웃해 주세요."}
+    proc = STATE.get("proc")
+    if proc is not None and proc.poll() is None:
+        return {"ok": False, "error": "로그인 창이 열려 있습니다. 그 창을 닫은 뒤에 다시 눌러 주세요."}
+    res = main.logout(quiet=True)
+    state = {"state": "none",
+             "detail": "로그아웃됨 — [카카오 로그인 창 열기]로 다시 로그인해 주세요."}
+    with STATE["lock"]:
+        STATE["login"] = state
+        STATE["login_checked_at"] = now_text()
+    if res.get("ok"):
+        add_line(f"[로그아웃] 저장된 카카오 세션을 지웠습니다(쿠키 {res.get('cookies', 0)}개)"
+                 + (f" · 지운 항목: {', '.join(res.get('removed') or [])}" if res.get("removed") else ""))
+    else:
+        add_line(f"[로그아웃] 일부 실패 — {res.get('detail')}")
+    return {"ok": bool(res.get("ok")), "state": state, **{k: res.get(k) for k in ("removed", "failed", "cookies")},
+            "error": None if res.get("ok") else res.get("detail")}
+
+
 def api_status() -> dict:
     raw = read_secret()
     cfg = main.load_notion_config()
@@ -582,6 +608,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(start_login())
         elif path == "/api/check-login":
             self._json({"ok": True, **check_login()})
+        elif path == "/api/logout":
+            r = logout_kakao()
+            self._json({"ok": r["ok"], "state": r.get("state"), "detail": r.get("state", {}).get("detail"),
+                        "removed": r.get("removed"), "cookies": r.get("cookies"),
+                        "error": r.get("error")})
         elif path == "/api/column":
             self._json(save_column(payload.get("column") or ""))
         elif path == "/api/notion-setup":
@@ -723,9 +754,11 @@ PAGE_HTML = r"""<!DOCTYPE html>
     <div class="pills">
       <span id="loginPill" class="pill"><i class="dot"></i>로그인 확인 중…</span>
       <button class="btn" id="btnCheckLogin">로그인 확인</button>
-      <button class="btn" id="btnLogin">로그인 창 열기</button>
+      <button class="btn" id="btnLogin">카카오 로그인 창 열기</button>
+      <button class="btn" id="btnLogout">카카오 로그아웃</button>
     </div>
   </header>
+  <p class="hint" style="margin:-8px 0 16px">한 화면에서 끝납니다 — ① [카카오 로그인 창 열기](처음 한 번) → ② 기록할 담당자 열 선택 → ③ [후보 목록 불러오기] → ④ [자동 신청 시작]</p>
 
   <section class="card">
     <h2>노션 연동 <span class="muted" id="notionSavedNote" style="font-weight:400;text-transform:none;letter-spacing:0"></span></h2>
@@ -1009,6 +1042,17 @@ $("btnStop").onclick = stopRun;
 $("btnLogin").onclick = async () => {
   const r = await api("/api/login", {});
   banner($("runBanner"), r.ok ? "로그인 창을 열었습니다. PC 화면의 크롬 창에서 로그인을 끝까지 마쳐 주세요." : r.error, r.ok ? "info" : "err");
+};
+$("btnLogout").onclick = async () => {
+  if(!confirm("카카오 로그아웃할까요?\n저장된 로그인 세션을 지웁니다(다른 계정으로 다시 로그인할 수 있습니다).")) return;
+  $("btnLogout").disabled = true;
+  try{
+    const r = await api("/api/logout", {});
+    banner($("runBanner"), r.ok ? "로그아웃했습니다. [카카오 로그인 창 열기]로 다시 로그인할 수 있습니다." : (r.error || "로그아웃하지 못했습니다."), r.ok ? "info" : "err");
+    await refreshStatus();
+  } finally {
+    $("btnLogout").disabled = false;
+  }
 };
 $("btnCheckLogin").onclick = async () => {
   const r = await api("/api/check-login", {});
