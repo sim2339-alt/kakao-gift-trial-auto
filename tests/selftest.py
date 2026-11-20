@@ -7,6 +7,7 @@
 
 - 1부: 필터/정렬 로직을 저장된 샘플 응답으로 검증
 - 2부: Playwright 페이지를 가짜 객체로 바꿔 신청 플로우(성공/이미신청/버튼없음/로그인필요) 검증
+- 6부: 웹 조종판(web_ui.py) API·실행/중단·토큰 미노출 검증
 """
 
 from __future__ import annotations
@@ -15,7 +16,9 @@ import json
 import os
 import re
 import sys
+import threading
 import time
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -75,7 +78,7 @@ def build_item(title, cats):
 
 
 def test_filter():
-    print("[1/4] 필터 검증")
+    print("[1/6] 필터 검증")
     flt = main.load_filter()
     cases = {
         "수플린 설향딸기 800g": "allow",
@@ -338,7 +341,7 @@ class FakePage:
 
 
 def test_apply_flow():
-    print("[2/4] 신청 플로우 검증 (가짜 브라우저)")
+    print("[2/6] 신청 플로우 검증 (가짜 브라우저)")
     campaign = {
         "campaignId": "abc",
         "campaignTitle": "테스트 상품",
@@ -593,7 +596,7 @@ class use_input:
 
 
 def test_notion():
-    print("[4/4] 노션 기록·설정·실행 모드 검증 (가짜 노션 API)")
+    print("[4/6] 노션 기록·설정·실행 모드 검증 (가짜 노션 API)")
     NOW = datetime(2026, 11, 20, 11, 0, 0)
     CFG = {"token": "ntn_dummy", "db_id": "db-dummy", "column": "메인.엽", "file": "notion_secret.json"}
     item = {
@@ -627,8 +630,8 @@ def test_notion():
     check("노션: 마감일·모집현황 'D-3 · 120/10명'",
           props.get("마감일·모집현황", {}).get("rich_text", [{}])[0].get("text", {}).get("content") == "D-3 · 120/10명",
           str(props.get("마감일·모집현황"))[:120])
-    check("노션: 내 열에 '11/20 O'",
-          props.get("메인.엽", {}).get("rich_text", [{}])[0].get("text", {}).get("content") == "11/20 O",
+    check("노션: 내 열에 '11/20'(날짜만)",
+          props.get("메인.엽", {}).get("rich_text", [{}])[0].get("text", {}).get("content") == "11/20",
           str(props.get("메인.엽"))[:120])
 
     # 2) 기존 행(내 열 비어 있음) → 새 행 없이 PATCH
@@ -641,7 +644,7 @@ def test_notion():
           list(stub.patches.get("p1", {}).keys()) == ["메인.엽"], str(stub.patches.get("p1"))[:160])
 
     # 3) 같은 날 이미 기록됨 → 그대로 둔다
-    stub = NotionStub(rows=[notion_row("p1", "abc123", "t", mark="11/20 O")])
+    stub = NotionStub(rows=[notion_row("p1", "abc123", "t", mark="11/20")])
     rec = main.notion_record(CFG, item, transport=stub, now=NOW)
     check("노션: 오늘 날짜 기록 있음 → unchanged", rec["status"] == "unchanged", f"{rec}")
     check("노션: unchanged 면 PATCH 하지 않음", stub.patches == {}, str(stub.patches))
@@ -650,7 +653,7 @@ def test_notion():
     stub = NotionStub(rows=[notion_row("p1", "abc123", "t", mark="11/19")])
     rec = main.notion_record(CFG, item, transport=stub, now=NOW)
     new = "".join(c["text"]["content"] for c in stub.patches["p1"]["메인.엽"]["rich_text"])
-    check("노션: 기존 기록 유지 + 덧붙임", rec["status"] == "updated" and new == "11/19\n11/20 O", f"{rec} / {new!r}")
+    check("노션: 기존 기록 유지 + 덧붙임", rec["status"] == "updated" and new == "11/19\n11/20", f"{rec} / {new!r}")
 
     # 5) 다른 계정 열을 쓰면 그 열에만 기록
     cfg2 = dict(CFG, column="서브.동")
@@ -660,7 +663,7 @@ def test_notion():
 
     # 5-1) 노션 검색 지연 대비 — 이번 배치 색인으로도 중복을 막는다
     rec = main.notion_record(CFG, item, transport=NotionStub(), now=NOW,
-                             index={"abc123": {"page_id": "p9", "mark": "11/20 O"}})
+                             index={"abc123": {"page_id": "p9", "mark": "11/20"}})
     check("노션: 색인에 오늘 기록이 있으면 unchanged", rec["status"] == "unchanged", f"{rec}")
     stub = NotionStub()
     rec = main.notion_record(CFG, item, transport=stub, now=NOW,
@@ -670,7 +673,7 @@ def test_notion():
     stub = NotionStub()
     rec = main.notion_record(CFG, item, transport=stub, now=NOW, index=idx)
     check("노션: 생성 후 배치 색인에 등록", rec["status"] == "created"
-          and idx.get("abc123", {}).get("mark") == "11/20 O", str(idx))
+          and idx.get("abc123", {}).get("mark") == "11/20", str(idx))
     rec = main.notion_record(CFG, item, transport=stub, now=NOW, index=idx)
     check("노션: 같은 배치에서 두 번째 기록 → 중복 생성 없음", rec["status"] == "unchanged", f"{rec}")
 
@@ -697,7 +700,7 @@ def test_notion():
     cfg3 = main.load_notion_config(path=str(tmp), column="서브.택")
     check("노션: CLI 열 이름이 파일보다 우선", cfg3["column"] == "서브.택", str(cfg3))
 
-    # 8) DB 전체 읽기 + 미체크 필터(모드 1)
+    # 8) DB 전체 읽기 + 1번 모드 선정(노션 DB 의 미체크 행만 · 신규 상품 제외)
     stub = NotionStub(rows=[
         notion_row("p1", "aaa", "체크된 상품", mark="11/20"),
         notion_row("p2", "bbb", "미체크 상품"),
@@ -705,12 +708,70 @@ def test_notion():
     ])
     scan = main.notion_scan(CFG, transport=stub)
     check("노션: DB 스캔으로 campaignId→행 매핑", set(scan) == {"aaa", "bbb", "ccc"}, str(scan.keys()))
-    cands = [{"campaignId": "bbb"}, {"campaignId": "aaa"}, {"campaignId": "ddd"}, {"campaignId": "ccc"}]
-    ordered, stat = main.order_by_notion(cands, scan)
-    check("모드1: 내 열 체크된 캠페인 제외", [c["campaignId"] for c in ordered] == ["bbb", "ccc", "ddd"],
-          str([c["campaignId"] for c in ordered]))
-    check("모드1: 미체크(DB 등록) 먼저 → 신규 다음",
-          stat["checked"] == 1 and stat["pending"] == 2 and stat["fresh"] == 1, str(stat))
+    rows = main.notion_rows(CFG, transport=stub)
+    check("노션: DB 전체 행을 행 단위로 읽는다(링크 키 추출)",
+          len(rows) == 3 and rows[1]["campaignId"] == "bbb" and rows[1]["mark"] == "", str(rows[:2]))
+
+    # 8-1) 모드 1: 노션 DB 에 있는 미체크 행만 → 신규(노션에 없는) 상품은 제외
+    def live_item(cid, title, cats):
+        it = build_item(title, cats)
+        it["campaignId"] = cid
+        return it
+
+    flt = main.load_filter()
+    live = [
+        live_item("bbb", "수플린 설향딸기 800g", [(93, "식품", 203, "과일·견과")]),
+        live_item("ccc", "무드웨어 블러 립스틱", [(95, "뷰티", 181, "메이크업")]),
+        live_item("eee", "스누피 3단 전기요", [(97, "디지털·가전", 163, "계절가전")]),
+        live_item("fff", "카테고리 미확인 상품", []),
+        live_item("ggg", "노션에 없는 신규 상품", [(93, "식품", 200, "디저트")]),
+    ]
+    rows = [
+        {"page_id": "p1", "campaignId": "aaa", "title": "체크된 상품", "mark": "11/20"},
+        {"page_id": "p2", "campaignId": "bbb", "title": "수플린 설향딸기", "mark": ""},
+        {"page_id": "p3", "campaignId": "bbb", "title": "수플린 설향딸기(중복 행)", "mark": ""},
+        {"page_id": "p4", "campaignId": "ccc", "title": "립스틱", "mark": ""},
+        {"page_id": "p5", "campaignId": "ddd", "title": "모집 끝난 상품", "mark": ""},
+        {"page_id": "p6", "campaignId": "eee", "title": "이미 신청한 상품", "mark": ""},
+        {"page_id": "p7", "campaignId": "fff", "title": "카테고리 미확인", "mark": ""},
+        {"page_id": "p8", "campaignId": "", "title": "링크 없는 행", "mark": ""},
+    ]
+    picked, held, stat = main.select_notion_targets(rows, live, applied={"eee"}, flt=flt)
+    ids = [c["campaignId"] for c in picked]
+    check("모드1: 노션 미체크 행만 대상", ids == ["bbb"], str(ids))
+    check("모드1: 노션에 없는 신규 상품은 제외", "ggg" not in ids, str(ids))
+    check("모드1: 목록에 없는(모집 종료·삭제) 행은 스킵", "ddd" not in ids and stat["ended"] == 1, str(stat))
+    check("모드1: 이미 신청(applied)한 행은 스킵", "eee" not in ids and stat["applied"] == 1, str(stat))
+    check("모드1: 체크된 행 제외", stat["checked"] == 1 and "aaa" not in ids, str(stat))
+    check("모드1: 같은 캠페인 중복 행은 1건으로 합침", stat["dup"] == 1 and ids.count("bbb") == 1, str(stat))
+    check("모드1: 링크 없는 행은 건수로 보고", stat["no_link"] == 1, str(stat))
+    check("모드1: 미체크 5건(캠페인 기준) · 모집 중 4 · 대상 1",
+          stat["pending"] == 5 and stat["live"] == 4 and stat["targets"] == 1, str(stat))
+    check("모드1: 제외 카테고리(립스틱)는 기본 제외",
+          stat["deny"] == 1 and "ccc" not in ids, str(stat))
+    check("모드1: 카테고리 미확인은 보류로 분리",
+          stat["hold"] == 1 and [c["campaignId"] for c in held] == ["fff"], str(stat))
+
+    # 8-2) --notion-all: 카테고리 기준까지 무시해도 신규 상품은 여전히 제외
+    picked2, _held2, _stat2 = main.select_notion_targets(
+        rows, live, applied={"eee"}, flt=flt, ignore_categories=True)
+    ids2 = [c["campaignId"] for c in picked2]
+    check("모드1: --notion-all 은 제외 카테고리까지 포함", "ccc" in ids2, str(ids2))
+    check("모드1: --notion-all 도 노션에 없는 신규 상품은 제외", "ggg" not in ids2, str(ids2))
+
+    # 8-3) 정렬: 인기순(신청자 많은 순) / 마감임박순
+    live_b = [dict(live_item("h1", "상품H1", [(93, "식품", 203, "과일·견과")]), applicationCount=10, remainingDays=5),
+              dict(live_item("h2", "상품H2", [(93, "식품", 203, "과일·견과")]), applicationCount=90, remainingDays=1)]
+    rows_b = [{"page_id": "q1", "campaignId": "h1", "title": "H1", "mark": ""},
+              {"page_id": "q2", "campaignId": "h2", "title": "H2", "mark": ""}]
+    pop, _h, _s = main.select_notion_targets(rows_b, live_b, flt=flt, sort_mode="popular")
+    check("모드1: 인기순 정렬", [c["campaignId"] for c in pop] == ["h2", "h1"], str([c["campaignId"] for c in pop]))
+    dl, _h, _s = main.select_notion_targets(rows_b, live_b, flt=flt, sort_mode="deadline")
+    check("모드1: 마감임박순 정렬", [c["campaignId"] for c in dl] == ["h2", "h1"], str([c["campaignId"] for c in dl]))
+
+    # 8-4) 신청 이력을 못 읽었을 때(applied=None)도 동작하고 그 사실을 남긴다
+    _p, _h, stat_n = main.select_notion_targets(rows, live, applied=None, flt=flt)
+    check("모드1: 신청 이력 없이도 선정(확인 불가 표시)", stat_n["applied_checked"] is False, str(stat_n))
 
     # 9) 스키마에서 참가자 열 후보 추리기
     schema = {
@@ -777,17 +838,18 @@ class FakeStdin:
 
 
 def test_main_modes():
-    print("[5/5] 실행 모드 통합 검증 (main() — 네트워크·브라우저 없이)")
+    print("[5/6] 실행 모드 통합 검증 (main() — 네트워크·브라우저 없이)")
     items = [
         build_item("스누피 3단 전기요", [(97, "디지털·가전", 163, "계절가전")]),
         build_item("수플린 설향딸기 800g", [(93, "식품", 203, "과일·견과")]),
         build_item("무드웨어 블러 립스틱", [(95, "뷰티", 181, "메이크업")]),   # 제외 대상
+        build_item("초콜릿 선물세트", [(93, "식품", 200, "디저트")]),          # 노션에 없는 신규
     ]
     saved = {
         "collect_campaigns": main.collect_campaigns,
         "collect_applied_ids": main.collect_applied_ids,
         "load_notion_config": main.load_notion_config,
-        "notion_scan": main.notion_scan,
+        "notion_rows": main.notion_rows,
         "run_apply": main.run_apply,
         "stdin": sys.stdin,
     }
@@ -812,16 +874,19 @@ def test_main_modes():
             rc = main.main([])
         check("모드: 대화형 2번 → 개수 10", rc == 0 and seen[-1]["limit"] == 10, f"rc={rc} {seen[-1:]}")
 
-        # (2) 인자 없이 대화형: 모드 1 → 노션 미체크만 + 개수 5
-        main.notion_scan = lambda cfg, transport=None: {
-            "id-스누피 3단": {"page_id": "p1", "title": "t", "mark": "11/20 O"},   # 체크됨 → 제외
-            "id-수플린 설향": {"page_id": "p2", "title": "t", "mark": ""},          # 미체크 → 우선
-        }
+        # (2) 인자 없이 대화형: 모드 1 → 노션 미체크(등록된 행)만 + 개수 5
+        main.notion_rows = lambda cfg, transport=None: [
+            {"page_id": "p1", "campaignId": "id-스누피 3단", "title": "t", "mark": "11/20"},  # 체크됨
+            {"page_id": "p2", "campaignId": "id-수플린 설향", "title": "t", "mark": ""},         # 미체크
+            {"page_id": "p3", "campaignId": "id-무드웨어 블", "title": "t", "mark": ""},         # 미체크지만 제외 카테고리
+        ]
         with use_input(["1", "5"]):
             rc = main.main([])
         got = seen[-1]
         check("모드1: 노션 체크된 상품 제외", "id-스누피 3단" not in got["ids"], str(got["ids"]))
         check("모드1: 미체크 상품은 대상에 포함", "id-수플린 설향" in got["ids"], str(got["ids"]))
+        check("모드1: 노션에 없는 신규 상품은 제외", "id-초콜릿 선물" not in got["ids"], str(got["ids"]))
+        check("모드1: 노션 미체크 행만으로 대상 구성", got["ids"] == ["id-수플린 설향"], str(got["ids"]))
         check("모드1: 개수 5 로 진행", rc == 0 and got["limit"] == 5, f"rc={rc} {got}")
         check("모드1: 노션 설정이 run_apply 로 전달", got["notion"] is not None, str(got["notion"]))
 
@@ -831,6 +896,13 @@ def test_main_modes():
         check("배치: --notion-pending --limit 2 → 묻지 않음", rc == 0 and seen[-1]["limit"] == 2
               and fake.prompts == [], f"rc={rc} prompts={fake.prompts}")
         check("배치: 미체크만 신청", "id-스누피 3단" not in seen[-1]["ids"], str(seen[-1]["ids"]))
+        check("배치: 신규 상품 제외", "id-초콜릿 선물" not in seen[-1]["ids"], str(seen[-1]["ids"]))
+
+        # (3-1) --notion-all: 제외 카테고리까지 포함(단 신규 상품은 여전히 제외)
+        with use_input([]) as fake:
+            rc = main.main(["--notion-pending", "--limit", "5", "--notion-all"])
+        check("--notion-all: 제외 카테고리 행 포함", "id-무드웨어 블" in seen[-1]["ids"], str(seen[-1]["ids"]))
+        check("--notion-all: 신규 상품은 제외 유지", "id-초콜릿 선물" not in seen[-1]["ids"], str(seen[-1]["ids"]))
 
         # (4) --limit 만 주면 모드 2 로 바로 실행
         with use_input([]) as fake:
@@ -857,7 +929,7 @@ def test_main_modes():
         main.collect_campaigns = saved["collect_campaigns"]
         main.collect_applied_ids = saved["collect_applied_ids"]
         main.load_notion_config = saved["load_notion_config"]
-        main.notion_scan = saved["notion_scan"]
+        main.notion_rows = saved["notion_rows"]
         main.run_apply = saved["run_apply"]
         sys.stdin = saved["stdin"]
 
@@ -867,8 +939,165 @@ def cleanup():
         path.unlink(missing_ok=True)
 
 
+# --------------------------------------------- 6부: 웹 조종판(web_ui) 검증
+def test_web():
+    print("[6/6] 웹 조종판 API 검증 (가짜 카카오·노션, 실제 HTTP 서버)")
+    import web_ui
+
+    web_ui.reset_state()
+    saved = {
+        "collect_campaigns": main.collect_campaigns,
+        "collect_applied_ids": main.collect_applied_ids,
+        "load_notion_config": main.load_notion_config,
+        "notion_rows": main.notion_rows,
+        "notion_list_columns": main.notion_list_columns,
+        "login_state": main.login_state,
+        "main": main.main,
+        "secret": main.NOTION_SECRET_FILE,
+    }
+    flt = main.load_filter()
+
+    def live_item(cid, title, cats):
+        it = build_item(title, cats)
+        it["campaignId"] = cid
+        return it
+
+    items = [
+        live_item("n1", "수플린 설향딸기 800g", [(93, "식품", 203, "과일·견과")]),
+        live_item("n2", "무드웨어 블러 립스틱", [(95, "뷰티", 181, "메이크업")]),
+        live_item("n3", "스누피 3단 전기요", [(97, "디지털·가전", 163, "계절가전")]),
+        live_item("x9", "노션에 없는 신규 상품", [(93, "식품", 200, "디저트")]),
+    ]
+    rows = [
+        {"page_id": "p1", "campaignId": "n1", "title": "수플린", "mark": ""},
+        {"page_id": "p2", "campaignId": "n2", "title": "립스틱", "mark": ""},
+        {"page_id": "p3", "campaignId": "n3", "title": "스누피", "mark": "11/20"},
+    ]
+    main.collect_campaigns = lambda mp: items
+    main.collect_applied_ids = lambda: None
+    main.notion_rows = lambda cfg, transport=None: rows
+    main.load_notion_config = lambda path=None, column=None: {
+        "token": "ntn_secret_dummy", "db_id": "db", "column": column or "메인.엽", "file": "x"}
+    main.notion_list_columns = lambda db, tok, transport=None: ["메인.엽", "서브.동"]
+    main.login_state = lambda: {"state": "ok", "detail": "테스트"}
+    try:
+        # 1) 상태 응답 — 열 목록은 주고 토큰은 주지 않는다
+        web_ui.check_login()          # 로그인 상태는 버튼을 놀렸을 때만 확인한다(캐시)
+        st = web_ui.api_status()
+        check("웹: 상태에 참가자 열 목록", st["notion"]["columns"] == ["메인.엽", "서브.동"], str(st["notion"]))
+        check("웹: 상태에 현재 열", st["notion"]["column"] == "메인.엽", str(st["notion"]))
+        check("웹: 상태에 로그인 상태", st["login"]["state"] == "ok", str(st["login"]))
+        check("웹: 상태 응답에 토큰 없음", "ntn_secret_dummy" not in json.dumps(st, ensure_ascii=False))
+
+        # 2) 미리보기 — 1번 모드는 노션 미체크 행만(신규 상품 제외)
+        pv = web_ui.preview("notion", 10)
+        ids = [i["campaignId"] for i in pv["items"]]
+        check("웹: 미리보기 성공", pv["ok"] and pv["total"] == 1, str(pv.get("summary")))
+        check("웹: 미리보기 1번 모드 = 노션 미체크 행만", ids == ["n1"], str(ids))
+        check("웹: 미리보기 신규 상품 제외", "x9" not in ids and "n3" not in ids, str(ids))
+        check("웹: 미리보기 요약 문구 포함", "노션 DB" in pv["summary"] and "244" not in pv["summary"], pv["summary"])
+        pv2 = web_ui.preview("list", 2)
+        check("웹: 2번 모드 미리보기", pv2["ok"] and len(pv2["items"]) == 2, str(pv2.get("summary")))
+        pv3 = web_ui.preview("notion", 5, notion_all=True)
+        check("웹: 제외 카테고리까지 포함 옵션", sorted(i["campaignId"] for i in pv3["items"]) == ["n1", "n2"],
+              str([i["campaignId"] for i in pv3["items"]]))
+
+        # 3) 참가자 열 저장 — 토큰은 그대로 두고 column 만 바꿈
+        tmp_secret = ROOT / "logs" / "_web_notion_secret.json"
+        tmp_secret.parent.mkdir(exist_ok=True)
+        tmp_secret.write_text(json.dumps({"enabled": True, "token": "ntn_keep_me",
+                                          "db_id": "db-x", "column": "메인.엽"}), encoding="utf-8")
+        main.NOTION_SECRET_FILE = str(tmp_secret)
+        web_ui.STATE["columns"] = None
+        saved_col = web_ui.save_column("서브.동")
+        written = json.loads(tmp_secret.read_text(encoding="utf-8"))
+        check("웹: 열 저장 성공", saved_col["ok"] and written["column"] == "서브.동", str(written))
+        check("웹: 열 저장 때 토큰·DB ID 보존", written["token"] == "ntn_keep_me" and written["db_id"] == "db-x",
+              str(written))
+        check("웹: 빈 열 이름은 거부", web_ui.save_column("  ")["ok"] is False)
+        tmp_secret.unlink(missing_ok=True)
+
+        # 4) 인자 조립
+        check("웹: 1번 모드 인자", web_ui.build_argv({"mode": "notion", "limit": 5}) ==
+              ["--notion-pending", "--limit", "5"], str(web_ui.build_argv({"mode": "notion", "limit": 5})))
+        argv = web_ui.build_argv({"mode": "list", "limit": 3, "sort": "deadline",
+                                 "skip_wishlist": True, "delay_min": 4, "delay_max": 6})
+        check("웹: 2번 모드 인자(정렬·대기·위시)",
+              argv == ["--limit", "3", "--sort", "deadline", "--skip-wishlist",
+                       "--delay-min", "4.0", "--delay-max", "6.0"], str(argv))
+        check("웹: --notion-all 인자", "--notion-all" in web_ui.build_argv({"mode": "notion", "notion_all": True}))
+
+        # 5) 실행 → 중단 → 요약(진짜 main 대신 가짜 함수)
+        def fake_main(argv):
+            print("[가짜] 신청 시작")
+            while not main.stop_requested():
+                time.sleep(0.02)
+            print("결과 요약: 성공 2건 / 스킵 1건 / 실패·불확실 0건")
+            print("노션 기록: 2건 성공 / 0건 실패")
+            return 0
+        main.main = fake_main
+        web_ui.reset_state()
+        r1 = web_ui.start_job({"mode": "notion", "limit": 2})
+        r2 = web_ui.start_job({"mode": "notion", "limit": 2})
+        web_ui.stop_job()
+        for _ in range(300):
+            if not web_ui.job_running():
+                break
+            time.sleep(0.02)
+        time.sleep(0.15)
+        lp = web_ui.log_payload(0)
+        check("웹: 자동 신청 시작", r1["ok"] is True and r1["argv"][0] == "--notion-pending", str(r1))
+        check("웹: 실행 중 두 번째 시작은 거부", r2["ok"] is False and "이미 실행 중" in r2["error"], str(r2))
+        check("웹: 중단 요청 → 실행 종료", not web_ui.job_running())
+        check("웹: 로그에 진행 출력이 쌓임", any("가짜" in l for l in lp["lines"]), str(lp["lines"][:3]))
+        check("웹: 완료 요약 숫자 파싱",
+              lp["summary"] and lp["summary"].get("ok") == 2 and lp["summary"].get("notion") == [2, 0],
+              str(lp["summary"]) + " / " + str(lp["lines"]))
+        check("웹: 완료 후 phase idle", lp["phase"] == "idle" and lp["running"] is False, str(lp["phase"]))
+
+        # 6) 실제 HTTP 서버 — 첫 화면·/api/status·/api/preview·없는 주소
+        httpd = web_ui.make_server("127.0.0.1", 0)
+        port = httpd.server_address[1]
+        th = threading.Thread(target=httpd.serve_forever, daemon=True)
+        th.start()
+        base = f"http://127.0.0.1:{port}"
+        try:
+            html = urllib.request.urlopen(base + "/", timeout=10).read().decode("utf-8")
+            check("웹: 첫 화면 HTML", "카카오 체험단" in html and "<script>" in html and "</html>" in html)
+            st2 = json.loads(urllib.request.urlopen(base + "/api/status", timeout=15).read().decode("utf-8"))
+            check("웹: /api/status 200", st2.get("version") == web_ui.APP_VERSION, str(st2)[:120])
+            check("웹: /api/status 토큰 미노출", "ntn_" not in json.dumps(st2, ensure_ascii=False))
+            req = urllib.request.Request(
+                base + "/api/preview", data=json.dumps({"mode": "notion", "limit": 3}).encode("utf-8"),
+                headers={"Content-Type": "application/json"}, method="POST")
+            pv4 = json.loads(urllib.request.urlopen(req, timeout=20).read().decode("utf-8"))
+            check("웹: /api/preview 동작", pv4.get("ok") is True and len(pv4.get("items") or []) <= 3,
+                  str(pv4)[:120])
+            try:
+                urllib.request.urlopen(base + "/api/nope", timeout=10)
+                missing = 200
+            except urllib.error.HTTPError as exc:
+                missing = exc.code
+            check("웹: 없는 API → 404", missing == 404, str(missing))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            th.join(timeout=3)
+    finally:
+        main.collect_campaigns = saved["collect_campaigns"]
+        main.collect_applied_ids = saved["collect_applied_ids"]
+        main.load_notion_config = saved["load_notion_config"]
+        main.notion_rows = saved["notion_rows"]
+        main.notion_list_columns = saved["notion_list_columns"]
+        main.login_state = saved["login_state"]
+        main.main = saved["main"]
+        main.NOTION_SECRET_FILE = saved["secret"]
+        main.reset_stop()
+        web_ui.reset_state()
+
+
 def test_login_logic():
-    print("[3/4] 로그인 로직 검증 (네트워크 없이)")
+    print("[3/6] 로그인 로직 검증 (네트워크 없이)")
     url = main._login_url()
     check("로그인 주소가 웹 로그인 입구(shopping-userauth-web)인가",
           url.startswith("https://shopping-userauth-web.kakao.com/login?channel=GIFT&redirect_url="), url[:80])
@@ -943,6 +1172,7 @@ if __name__ == "__main__":
     test_login_logic()
     test_notion()
     test_main_modes()
+    test_web()
     cleanup()
     print()
     if FAILS:

@@ -14,18 +14,20 @@ if "%PY%"=="" (
 echo ============================================================
 echo  카카오 체험단 자동 신청
 echo ============================================================
-echo   1) 노션에 내 체크가 안 된 것만 신청  ^(노션 DB 확인 -> 이미 체크된 건 제외^)
+echo   1) 노션 DB 미체크 행만 신청  ^(노션에 없는 신규 상품은 제외^)
 echo   2) 최근·인기순에서 몇 개 신청       ^(기본 30개^)
 echo   3) 노션 연동 설정 만들기 ^(notion_secret.json^)
+echo   4) 웹 조종판 열기  ^(브라우저에서 버튼으로 조작^)
 echo.
 set MODE=
-set /p MODE=번호를 고르세요 [1/2/3] (그냥 Enter = 2): 
+set /p MODE=번호를 고르세요 [1/2/3/4] (그냥 Enter = 2): 
 if "%MODE%"=="" set MODE=2
 if "%MODE%"=="1" goto MODE1
 if "%MODE%"=="2" goto MODE2
 if "%MODE%"=="3" goto SETUP
+if "%MODE%"=="4" goto WEB
 echo.
-echo [안내] 1, 2, 3 중에서 골라 주세요.
+echo [안내] 1, 2, 3, 4 중에서 골라 주세요.
 pause
 exit /b 1
 
@@ -50,6 +52,11 @@ goto DONE
 :SETUP
 echo.
 %PY% main.py --setup-notion
+goto DONE
+
+:WEB
+echo.
+%PY% web_ui.py
 goto DONE
 
 :DONE

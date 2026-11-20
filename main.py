@@ -274,6 +274,42 @@ def collect_applied_ids() -> set | None:
 
 
 # ---------------------------------------------------------------------------
+# 3-B. 실행 중지 · 로그인 상태 (터미널·웹 조종판 공용)
+# ---------------------------------------------------------------------------
+_STOP = {"flag": False}
+
+
+def request_stop():
+    """진행 중인 신청 루프에 중단을 요청한다(다음 상품으로 넘어가기 전에 멈춘다)."""
+    _STOP["flag"] = True
+
+
+def reset_stop():
+    """중단 요청을 지운다(새 실행을 시작할 때)."""
+    _STOP["flag"] = False
+
+
+def stop_requested() -> bool:
+    return bool(_STOP["flag"])
+
+
+def login_state() -> dict:
+    """저장된 세션으로 신청 이력 API 를 한 번 호출해 로그인 상태만 본다(브라우저 없이).
+
+    반환: {"state": "ok"|"none"|"unknown", "detail": 사람이 읽을 안내}
+    """
+    if not _load_state_cookies():
+        return {"state": "none",
+                "detail": "저장된 세션이 없습니다. [로그인 창 열기]로 한 번 로그인해 주세요."}
+    status, _data, err = fetch_json(f"{HISTORY_API}?page=0&size=1", use_session=True)
+    if status == 200:
+        return {"state": "ok", "detail": "신청 이력 API 200 — 로그인 유지 중"}
+    if status == 401:
+        return {"state": "none", "detail": "세션이 만료됐습니다(401). [로그인 창 열기]로 다시 로그인해 주세요."}
+    return {"state": "unknown", "detail": f"확인 실패(HTTP {status} {str(err or '')[:60]})"}
+
+
+# ---------------------------------------------------------------------------
 # 3. 필터링 / 정렬
 # ---------------------------------------------------------------------------
 def classify(item: dict, flt: dict):
@@ -336,6 +372,21 @@ def category_label(item: dict) -> str:
     return f"{lname}>{mname}" if mname else lname
 
 
+def candidate_row(item: dict) -> dict:
+    """미리보기·CSV 용 한 줄 요약(터미널·웹 조종판 공용)."""
+    cid = item.get("campaignId", "")
+    return {
+        "campaignId": cid,
+        "title": (item.get("campaignTitle") or "").strip(),
+        "brand": (item.get("brand") or {}).get("name", ""),
+        "applicationCount": item.get("applicationCount") or 0,
+        "recruitmentCount": item.get("recruitmentCount") or 0,
+        "remainingDays": item.get("remainingDays"),
+        "category": category_label(item),
+        "url": DETAIL_PAGE.format(cid=cid),
+    }
+
+
 def build_candidates(items: list, flt: dict, sort_mode: str, exclude_ids: set | None,
                      include_unknown: bool = False) -> tuple:
     """(신청 후보, 보류 후보, 제외 건수) 반환."""
@@ -356,12 +407,8 @@ def build_candidates(items: list, flt: dict, sort_mode: str, exclude_ids: set | 
             continue
         passed.append(item)
 
-    if sort_mode == "deadline":
-        passed.sort(key=lambda x: (x.get("remainingDays", 999), -(x.get("applicationCount") or 0)))
-        held.sort(key=lambda x: (x.get("remainingDays", 999), -(x.get("applicationCount") or 0)))
-    else:  # popular
-        passed.sort(key=lambda x: -(x.get("applicationCount") or 0))
-        held.sort(key=lambda x: -(x.get("applicationCount") or 0))
+    _sort_items(passed, sort_mode)
+    _sort_items(held, sort_mode)
 
     print(f"[필터] 허용 {len(passed)}개 / 보류 {len(held)}개 / 제외 {denied}개")
     return passed, held, denied
@@ -546,9 +593,13 @@ def _cid_from_link(link: str) -> str:
 
 
 def notion_mark(now: datetime | None = None) -> str:
-    """참가자 열에 남기는 표시 — 예: '11/20 O'"""
+    """참가자 열에 남기는 표시 — 날짜만, 예: '11/20'
+
+    기존 현황표(519행)가 'M/D' 형식으로 적혀 있어 1군단 연동과 맞춘다.
+    (체크 표시 'O' 나 영문 약어는 붙이지 않는다.)
+    """
     now = now or datetime.now()
-    return f"{now.month}/{now.day} O"
+    return f"{now.month}/{now.day}"
 
 
 def notion_row_title(item: dict) -> str:
@@ -647,9 +698,10 @@ def notion_record(cfg: dict, item: dict, transport=None, now: datetime | None = 
         if found:
             page_id = found["page_id"]
             cur = (found.get("mark") or "").strip()
+            lines = [ln.strip() for ln in cur.splitlines() if ln.strip()]
             if not cur:
                 new = mark
-            elif mark.split()[0] in cur:      # 오늘 날짜가 이미 적혀 있으면 손대지 않는다
+            elif mark in lines:               # 오늘 날짜가 이미 적혀 있으면 손대지 않는다
                 return {"status": "unchanged", "detail": "이미 기록됨"}
             else:
                 new = f"{cur}\n{mark}"        # 기존 내용은 지우지 않고 줄을 바꿔 덧붙인다
@@ -677,14 +729,15 @@ def notion_record(cfg: dict, item: dict, transport=None, now: datetime | None = 
         return {"status": "failed", "detail": f"{type(exc).__name__}: {str(exc)[:80]}"}
 
 
-def notion_scan(cfg: dict, transport=None) -> dict | None:
-    """노션 DB 전체를 읽어 {campaignId: {"page_id", "title", "mark"}} 로 돌려준다.
+def notion_rows(cfg: dict, transport=None) -> list | None:
+    """노션 DB 전체 행을 읽어 [{"page_id", "campaignId", "title", "mark"}] 로 돌려준다.
 
+    링크가 없거나 campaignId 를 못 읽은 행도 "campaignId": "" 로 남긴다(모드 1 이 건수로 알려 준다).
     조회에 실패하면 None — 호출 쪽(mode 1)은 이때 신청을 진행하지 않는다(중복 신청 방지).
     """
     tr = transport or _notion_http
     column = cfg["column"]
-    out, cursor, pages = {}, None, 0
+    out, cursor, pages = [], None, 0
     while pages < 50:
         payload = {"page_size": 100}
         if cursor:
@@ -695,14 +748,12 @@ def notion_scan(cfg: dict, transport=None) -> dict | None:
             return None
         for row in data.get("results") or []:
             props = row.get("properties") or {}
-            cid = _cid_from_link(_plain(props.get("링크")))
-            if not cid:
-                continue
-            out[cid] = {
+            out.append({
                 "page_id": row.get("id"),
+                "campaignId": _cid_from_link(_plain(props.get("링크"))),
                 "title": _plain(props.get("상품명·브랜드")),
                 "mark": _plain(props.get(column)),
-            }
+            })
         cursor = data.get("next_cursor")
         pages += 1
         if not data.get("has_more") or not cursor:
@@ -710,23 +761,91 @@ def notion_scan(cfg: dict, transport=None) -> dict | None:
     return out
 
 
-def order_by_notion(candidates: list, scan: dict) -> tuple[list, dict]:
-    """mode 1: 내 열에 체크가 안 된 것만 추린다.
+def notion_index_from_rows(rows: list) -> dict:
+    """행 목록 → {campaignId: {"page_id", "title", "mark"}} (notion_record 의 중복 방지 색인)."""
+    out = {}
+    for row in rows or []:
+        cid = (row.get("campaignId") or "").strip()
+        if not cid:
+            continue
+        out[cid] = {"page_id": row.get("page_id"), "title": row.get("title") or "",
+                    "mark": row.get("mark") or ""}
+    return out
 
-    · 노션 DB 에 이미 있고 내 열이 비어 있는 행 → 먼저
-    · 노션 DB 에 아예 없는(신규) 행 → 그 다음
-    · 노션 DB 에 있고 내 열이 채워진 행 → 제외
+
+def notion_scan(cfg: dict, transport=None) -> dict | None:
+    """노션 DB 전체를 읽어 {campaignId: {"page_id", "title", "mark"}} 로 돌려준다."""
+    rows = notion_rows(cfg, transport)
+    return None if rows is None else notion_index_from_rows(rows)
+
+
+def _sort_items(items: list, sort_mode: str) -> list:
+    """인기순 / 마감임박순 정렬(제자리)."""
+    if sort_mode == "deadline":
+        items.sort(key=lambda x: (x.get("remainingDays", 999), -(x.get("applicationCount") or 0)))
+    else:
+        items.sort(key=lambda x: -(x.get("applicationCount") or 0))
+    return items
+
+
+def select_notion_targets(rows: list, live_items: list, applied: set | None = None,
+                          flt: dict | None = None, sort_mode: str = "popular",
+                          include_unknown: bool = False,
+                          ignore_categories: bool = False) -> tuple[list, list, dict]:
+    """1번 모드: **노션 DB 에 이미 등록된 행 중 내 열이 비어 있는 행만** 신청 대상으로 고른다.
+
+    · 노션 행의 링크에서 읽은 campaignId 로 카카오 목록(IN_PROGRESS)과 매칭한다.
+    · 목록에 없는 행 = 모집 종료·삭제된 상품 → 건너뛴다(신청하지 않는다).
+    · 카카오 목록에만 있고 노션에 없는 신규 상품은 절대 넣지 않는다.
+    · 신청 이력(applied)에 있으면 건너뛴다.
+    · 카테고리 기준(flt)은 기존 2번 모드와 똑같이 적용한다(ignore_categories=True 면 무시).
+
+    반환: (신청 대상, 보류 목록, 통계 dict)
     """
-    pending, fresh, checked = [], [], 0
-    for item in candidates:
-        row = scan.get(item.get("campaignId") or "")
-        if row is None:
-            fresh.append(item)
-        elif (row.get("mark") or "").strip():
-            checked += 1
-        else:
-            pending.append(item)
-    return pending + fresh, {"checked": checked, "pending": len(pending), "fresh": len(fresh)}
+    live = {}
+    for item in live_items or []:
+        cid = (item.get("campaignId") or "").strip()
+        if cid:
+            live[cid] = item
+    stat = {"rows": len(rows or []), "no_link": 0, "checked": 0, "pending": 0,
+            "dup": 0, "live": 0, "ended": 0, "applied": 0, "applied_checked": applied is not None,
+            "deny": 0, "hold": 0, "targets": 0}
+    picked, held, seen = [], [], set()
+    for row in rows or []:
+        cid = (row.get("campaignId") or "").strip()
+        if not cid:
+            stat["no_link"] += 1
+            continue
+        if (row.get("mark") or "").strip():
+            stat["checked"] += 1
+            continue
+        if cid in seen:          # 같은 캠페인이 여러 행에 있어도 신청은 한 번만
+            stat["dup"] += 1
+            continue
+        seen.add(cid)
+        stat["pending"] += 1
+        item = live.get(cid)
+        if item is None:          # 카카오 목록(모집 중)에 없음 → 모집 종료·삭제
+            stat["ended"] += 1
+            continue
+        stat["live"] += 1
+        if applied and cid in applied:
+            stat["applied"] += 1
+            continue
+        if flt is not None and not ignore_categories:
+            decision, _reason = classify(item, flt)
+            if decision == "deny":
+                stat["deny"] += 1
+                continue
+            if decision == "hold" and not include_unknown:
+                stat["hold"] += 1
+                held.append(item)
+                continue
+        picked.append(item)
+    _sort_items(picked, sort_mode)
+    _sort_items(held, sort_mode)
+    stat["targets"] = len(picked)
+    return picked, held, stat
 
 
 def ask_limit(default: int = LIMIT_DEFAULT, prompt: str | None = None) -> int:
@@ -870,7 +989,7 @@ def ask_run_mode() -> tuple[str, int]:
     """대화형 실행: 모드(1=노션 미체크만 / 2=최근·인기순)와 개수를 물어본다."""
     print()
     print("실행 모드를 골라 주세요.")
-    print("  1) 노션에 내 체크가 안 된 것만 신청  (노션 DB 를 먼저 읽어 이미 체크된 건 제외)")
+    print("  1) 노션 DB 의 미체크 행만 신청  (노션에 없는 신규 상품은 제외)")
     print("  2) 최근·인기순에서 몇 개 신청        (기존 방식)")
     mode = ""
     while mode not in ("1", "2"):
@@ -1674,6 +1793,9 @@ def run_apply(candidates: list, args) -> int:
             return 2
 
         for idx, item in enumerate(targets, 1):
+            if stop_requested():
+                print("\n[중단] 중단 요청을 받아 남은 상품은 신청하지 않습니다.")
+                break
             title = (item.get("campaignTitle") or "")[:36]
             print(f"\n({idx}/{len(targets)}) {title} … ", end="", flush=True)
             try:
@@ -1750,7 +1872,9 @@ def main(argv=None) -> int:
                     help="카테고리 정보가 없는 상품까지 신청 대상에 포함(기본은 보류)")
     ap.add_argument("--notion-pending", "--only-notion-unchecked", dest="notion_pending",
                     action="store_true",
-                    help="노션에 내 열 체크가 없는 상품만 신청 (미체크 우선, 이미 체크된 건 제외)")
+                    help="노션 DB 에 이미 등록된 행 중 내 열 체크가 없는 상품만 신청 (노션에 없는 카카오 신규 상품은 제외)")
+    ap.add_argument("--notion-all", dest="notion_all", action="store_true",
+                    help="1번 모드에서 카테고리 기준(제외 카테고리·제외 키워드)까지 무시하고 노션 미체크 행 전부를 대상으로 함")
     ap.add_argument("--notion-column", dest="notion_column", default=None,
                     help=f"노션 참가자 열 이름 (기본: notion_secret.json 의 column, 없으면 '{NOTION_DEFAULT_COLUMN}')")
     ap.add_argument("--setup-notion", dest="setup_notion", action="store_true",
@@ -1758,6 +1882,7 @@ def main(argv=None) -> int:
     ap.add_argument("--no-notion", dest="no_notion", action="store_true",
                     help="노션 기록을 끄고 CSV 만 저장")
     args = ap.parse_args(argv)
+    reset_stop()      # 새 실행 — 이전 중단 요청을 지운다
 
     if args.setup_notion:
         return 0 if setup_notion() else 1
@@ -1822,28 +1947,49 @@ def main(argv=None) -> int:
         return 1
 
     applied = collect_applied_ids()
-    candidates, held, denied = build_candidates(
-        items, flt, args.sort, applied, include_unknown=args.include_unknown
-    )
+    if mode == "notion":
+        # 1번 모드는 노션 DB 행을 기준으로 따로 고른다(아래 분기에서 채운다).
+        candidates, held, denied = [], [], 0
+    else:
+        candidates, held, denied = build_candidates(
+            items, flt, args.sort, applied, include_unknown=args.include_unknown
+        )
 
 
-    # ── 1번 모드: 노션에 내 열 체크가 없는 상품만(미체크 우선) 신청한다.
+    # ── 1번 모드: 노션 DB 에 이미 등록된 행 중 내 열이 비어 있는 상품만 신청한다.
+    #    카카오 목록에만 있고 노션에 없는 신규 상품은 절대 넣지 않는다.
     if mode == "notion":
         if not notion_cfg:
             print("[중단] 1번 모드(노션 미체크만)는 노션 설정이 필요합니다.")
             print("       배치로 실행하려면: python main.py --setup-notion")
             return 1
-        scan = notion_scan(notion_cfg)
-        if scan is None:
+        rows = notion_rows(notion_cfg)
+        if rows is None:
             print("[중단] 노션 DB 를 읽지 못해 미체크 목록을 확인할 수 없습니다.")
             print("       (중복 신청을 막기 위해 이번 실행은 진행하지 않습니다.)")
             return 1
-        args.notion_index = scan
-        candidates, nstat = order_by_notion(candidates, scan)
-        print(f"[노션] DB {len(scan)}행 · 내 열({notion_cfg['column']}) 체크 완료 {nstat['checked']}건 제외"
-              f" → 미체크 {nstat['pending']}건 + 신규 {nstat['fresh']}건 = 대상 {len(candidates)}건")
+        args.notion_index = notion_index_from_rows(rows)
+        candidates, held, nstat = select_notion_targets(
+            rows, items, applied=applied, flt=flt, sort_mode=args.sort,
+            include_unknown=args.include_unknown, ignore_categories=args.notion_all)
+        print(f"[노션] DB {nstat['rows']}행 중 내 열({notion_cfg['column']}) 체크 완료 {nstat['checked']}행 제외"
+              f" → 미체크 {nstat['pending']}건")
+        if nstat["no_link"]:
+            print(f"       링크(캠페인 주소)가 없어 건너뛴 행 {nstat['no_link']}행")
+        print(f"       지금 모집 중 {nstat['live']}건 · 카카오 목록에 없음(모집 종료·삭제) {nstat['ended']}건 제외")
+        if nstat["applied_checked"]:
+            print(f"       이미 신청한 건 {nstat['applied']}건 제외")
+        else:
+            print("       (신청 이력을 확인하지 못했습니다 — run_login.bat 으로 로그인하면 이미 신청한 건도 걸러집니다)")
+        if nstat["dup"]:
+            print(f"       같은 캠페인이 여러 행에 있어 1건으로 합침 {nstat['dup']}행")
+        if args.notion_all:
+            print("       카테고리 기준 무시(--notion-all): 제외 카테고리도 대상에 포함")
+        elif nstat["deny"] or nstat["hold"]:
+            print(f"       카테고리 기준 제외 {nstat['deny']}건 · 카테고리 미확인 보류 {nstat['hold']}건")
+        print(f"     → 신청 대상 {len(candidates)}건 (노션에 없는 신규 상품은 넣지 않습니다)")
         if not candidates:
-            print("미체크 상품이 없습니다. (오늘 진행 중 목록 기준)")
+            print("미체크 상품이 없습니다. (노션 DB 기준 · 지금 모집 중인 것만)")
             return 0
 
     if args.dry_run:
