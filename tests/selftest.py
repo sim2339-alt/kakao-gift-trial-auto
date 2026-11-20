@@ -11,6 +11,7 @@
 - 7부: 노션 API 설정 1회 저장 → 이후 실행은 담당자 열만 선택(토큰·DB ID 재질문 없음) 검증
 - 8부: 원스톱 실행기(run.bat)와 루트 정리, 웹 조종판 한 화면 흐름 검증
 - 9부: 카카오 로그아웃(세션 파일 삭제 → 다른 계정 로그인) — CLI·웹 검증
+- 10부: 담당자 열 목록 — 노션 페이지 주소 붙여넣기 정규화 · `_columns` 폴백 · [↻ 새로고침] 검증
 """
 
 from __future__ import annotations
@@ -84,7 +85,7 @@ def build_item(title, cats):
 
 
 def test_filter():
-    print("[1/9] 필터 검증")
+    print("[1/10] 필터 검증")
     flt = main.load_filter()
     cases = {
         "수플린 설향딸기 800g": "allow",
@@ -347,7 +348,7 @@ class FakePage:
 
 
 def test_apply_flow():
-    print("[2/9] 신청 플로우 검증 (가짜 브라우저)")
+    print("[2/10] 신청 플로우 검증 (가짜 브라우저)")
     campaign = {
         "campaignId": "abc",
         "campaignTitle": "테스트 상품",
@@ -602,7 +603,7 @@ class use_input:
 
 
 def test_notion():
-    print("[4/9] 노션 기록·설정·실행 모드 검증 (가짜 노션 API)")
+    print("[4/10] 노션 기록·설정·실행 모드 검증 (가짜 노션 API)")
     NOW = datetime(2026, 11, 20, 11, 0, 0)
     CFG = {"token": "ntn_dummy", "db_id": "db-dummy", "column": "메인.엽", "file": "notion_secret.json"}
     item = {
@@ -854,8 +855,7 @@ class FakeStdin:
 
 
 def test_main_modes():
-    print("[5/9] 실행 모드 통합 검증 (main() — 네트워크·브라우저 없이)")
-    main.notion_list_columns = lambda db, tok, transport=None: ["메인.엽", "서브.동"]
+    print("[5/10] 실행 모드 통합 검증 (main() — 네트워크·브라우저 없이)")
     items = [
         build_item("스누피 3단 전기요", [(97, "디지털·가전", 163, "계절가전")]),
         build_item("수플린 설향딸기 800g", [(93, "식품", 203, "과일·견과")]),
@@ -871,6 +871,8 @@ def test_main_modes():
         "run_apply": main.run_apply,
         "stdin": sys.stdin,
     }
+    # 패치는 saved 를 담은 뒤에 한다(먼저 패치하면 복구할 때 가짜 함수가 남는다)
+    main.notion_list_columns = lambda db, tok, transport=None: ["메인.엽", "서브.동"]
     seen = []
 
     def fake_run_apply(candidates, args):
@@ -976,7 +978,7 @@ def cleanup():
 
 # --------------------------------------------- 6부: 웹 조종판(web_ui) 검증
 def test_web():
-    print("[6/9] 웹 조종판 API 검증 (가짜 카카오·노션, 실제 HTTP 서버)")
+    print("[6/10] 웹 조종판 API 검증 (가짜 카카오·노션, 실제 HTTP 서버)")
     import web_ui
 
     web_ui.reset_state()
@@ -1167,7 +1169,7 @@ def test_web():
 
 
 def test_login_logic():
-    print("[3/9] 로그인 로직 검증 (네트워크 없이)")
+    print("[3/10] 로그인 로직 검증 (네트워크 없이)")
     url = main._login_url()
     check("로그인 주소가 웹 로그인 입구(shopping-userauth-web)인가",
           url.startswith("https://shopping-userauth-web.kakao.com/login?channel=GIFT&redirect_url="), url[:80])
@@ -1238,7 +1240,7 @@ def test_login_logic():
 
 # --------------------- 7부: 노션 1회 저장 · 담당자 열만 선택(다시 묻지 않음)
 def test_notion_once():
-    print("[7/9] 노션 1회 저장 · 담당자 열만 선택 검증 (가짜 노션 API)")
+    print("[7/10] 노션 1회 저장 · 담당자 열만 선택 검증 (가짜 노션 API)")
     tmp = ROOT / "logs" / "_once_notion_secret.json"
     tmp.parent.mkdir(exist_ok=True)
     tmp.write_text(json.dumps({"enabled": True, "token": "ntn_saved_once", "db_id": "db-once",
@@ -1420,7 +1422,7 @@ def test_notion_once():
 
 # ------------------------------- 8부: 원스톱 실행(run.bat) · 루트 정리 · 한 화면 흐름
 def test_onestop():
-    print("[8/9] 원스톱 실행기(run.bat) · 루트 정리 · 웹 한 화면 흐름 검증")
+    print("[8/10] 원스톱 실행기(run.bat) · 루트 정리 · 웹 한 화면 흐름 검증")
     root = ROOT
     run_bat = root / "run.bat"
     run_sh = root / "run.sh"
@@ -1480,7 +1482,7 @@ def test_onestop():
 
 
 def test_logout():
-    print("[9/9] 카카오 로그아웃 검증 (세션 파일 삭제 · CLI · 웹)")
+    print("[9/10] 카카오 로그아웃 검증 (세션 파일 삭제 · CLI · 웹)")
     import web_ui
 
     prof = ROOT / "logs" / "_logout_profile"
@@ -1574,6 +1576,373 @@ def test_logout():
         web_ui.reset_state()
 
 
+# ------------- 10부: 담당자 열 목록 — 노션 주소 정규화 · 폴백 · [↻ 새로고침]
+NOTION_URL = ("https://www.notion.so/sinyeob/41a27dbea66981939138de51fa8dfb1c"
+              "?v=1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f&pvs=4")
+NOTION_UUID = "41a27dbe-a669-8193-9138-de51fa8dfb1c"
+NOTION_SCHEMA_TEN = {
+    "상품명·브랜드": {"type": "title"},
+    "메인.엽": {"type": "rich_text"},
+    "1팀.엽2(2200)": {"type": "rich_text"},
+    "서브.동": {"type": "rich_text"},
+    "서브.준": {"type": "rich_text"},
+    "옵션": {"type": "rich_text"},
+    "메커니즘": {"type": "rich_text"},
+    "마감일·모집현황": {"type": "rich_text"},
+    "링크": {"type": "url"},
+    "등록일": {"type": "created_time"},
+}
+
+
+class StrictNotionStub:
+    """노션 실제 API 처럼 동작하는 가짜 서버 — DB ID 형식이 틀리면 400('Invalid request URL.').
+
+    실제 노션은 `/databases/https://www.notion.so/....` 같은 주소를 받으면 400 을 돌려준다.
+    이 스텁으로 '주소를 그대로 저장했을 때 왜 열 목록이 안 나오는지'를 재현/검증한다.
+    """
+
+    ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{32}")
+
+    def __init__(self, schema=None, deny=(), databases=None):
+        self.schema = schema if schema is not None else NOTION_SCHEMA_TEN
+        self.deny = set(deny)     # 이 DB ID 는 403(통합이 연결되지 않은 DB 흉내)
+        self.databases = databases   # None → DB 목록 검색은 404(통합이 아무 DB 에도 없음)
+        self.calls = []
+        self.searches = []
+        self.schemas = {str(d["id"]).replace("-", ""): (d.get("properties") or {})
+                        for d in (databases or [])}
+
+    def __call__(self, method, path, payload, token, timeout=None):
+        self.calls.append((method, path))
+        if method == "POST" and path == "/search":
+            if self.databases is None:
+                return 404, {"message": "not found"}, '{"message":"not found"}'
+            self.searches.append(payload or {})
+            results = [{
+                "object": "database",
+                "id": d["id"],
+                "title": [{"type": "text", "text": {"content": d["title"]}, "plain_text": d["title"]}],
+                "properties": d.get("properties") or {},
+            } for d in self.databases]
+            return 200, {"object": "list", "results": results, "has_more": False, "next_cursor": None}, None
+        if method == "GET" and path.startswith("/databases/"):
+            db = path[len("/databases/"):]
+            if not self.ID_RE.fullmatch(db):
+                return 400, {"message": "Invalid request URL."}, '{"message":"Invalid request URL."}'
+            if db.replace("-", "") in {d.replace("-", "") for d in self.deny}:
+                return 403, {"message": "Unauthorized"}, '{"message":"Unauthorized"}'
+            schema = self.schemas.get(db.replace("-", ""), self.schema)
+            return 200, {"object": "database", "properties": schema}, None
+        return 404, {"message": "not found"}, None
+
+
+def test_column_discovery():
+    print("[10/10] 담당자 열 목록 — 주소 정규화 · 토큰만으로 DB 자동 찾기 · 폴백 · 새로고침 검증")
+    import web_ui
+
+    read = lambda: (ROOT / "web_ui.py").read_text(encoding="utf-8")
+
+    # 1) DB ID 정규화 — 주소·32자·UUID 를 모두 8-4-4-4-12 로
+    check("DB ID: 페이지 주소 → ID 추출", main.normalize_notion_db_id(NOTION_URL) == NOTION_UUID,
+          main.normalize_notion_db_id(NOTION_URL))
+    check("DB ID: 하이픈 없는 32자 → UUID",
+          main.normalize_notion_db_id("41a27dbea66981939138de51fa8dfb1c") == NOTION_UUID)
+    check("DB ID: 이미 정리된 UUID 그대로", main.normalize_notion_db_id(NOTION_UUID) == NOTION_UUID)
+    check("DB ID: 앞뒤 공백·따옴표 정리", main.normalize_notion_db_id('  "' + NOTION_URL + '"  ') == NOTION_UUID)
+    check("DB ID: 앵커(#) 붙은 주소도 처리",
+          main.normalize_notion_db_id("https://www.notion.so/x/41a27dbea66981939138de51fa8dfb1c#abc") == NOTION_UUID)
+    check("DB ID: ID 가 없는 값은 그대로", main.normalize_notion_db_id("db-once") == "db-once")
+    check("DB ID: 빈 값", main.normalize_notion_db_id("  ") == "" and main.normalize_notion_db_id(None) == "")
+
+    # 2) 원인 재현 — 주소를 그대로 API 경로에 넣으면 노션은 400 을 준다(예전 증상: 열 0개 → 저장된 1개만 노출)
+    strict = StrictNotionStub()
+    status, _data, _err = strict("GET", f"/databases/{NOTION_URL}", None, "ntn_x")
+    check("원인 재현: DB ID 자리에 주소를 넣으면 400", status == 400, str(status))
+    check("원인 재현: 정리된 ID 로는 같은 스텁이 200", strict("GET", f"/databases/{NOTION_UUID}", None, "ntn_x")[0] == 200)
+
+    # 3) notion_list_columns() 는 주소를 받아도 스스로 정리해 읽는다
+    main.NOTION_LAST_ERROR.update({"db_id": None, "message": None})
+    cols = main.notion_list_columns(NOTION_URL, "ntn_x", transport=StrictNotionStub())
+    check("주소 붙여넣기: notion_list_columns 가 열 4개를 읽음",
+          cols is not None and len(cols) == 4 and cols[0] == "메인.엽", str(cols))
+    check("주소 붙여넣기: 읽었으면 실패 사유 없음", main.notion_last_error() is None, str(main.notion_last_error()))
+
+    # 4) 웹 ⚙설정: 주소를 넣어도 ID 만 저장하고, 열 목록을 즉시 반영
+    tmp = ROOT / "logs" / "_cols_secret.json"
+    tmp.parent.mkdir(exist_ok=True)
+    tmp.write_text(json.dumps({"enabled": True, "token": "ntn_old", "db_id": "db-old",
+                               "column": "메인.엽"}), encoding="utf-8")
+    saved = {"http": main._notion_http, "secret": main.NOTION_SECRET_FILE,
+             "columns": main.notion_list_columns}
+    main._notion_http = StrictNotionStub()
+    main.NOTION_SECRET_FILE = str(tmp)
+    web_ui.reset_state()
+    try:
+        r = web_ui.save_notion_settings("ntn_url_token", NOTION_URL, "")
+        data = json.loads(tmp.read_text(encoding="utf-8"))
+        check("웹 ⚙설정: 주소에서 DB ID 만 저장", r["ok"] and data["db_id"] == NOTION_UUID, str(data.get("db_id")))
+        check("웹 ⚙설정: 토큰 저장", data["token"] == "ntn_url_token")
+        check("웹 ⚙설정: 응답에 정규화된 DB ID 안내", r.get("normalized_db") == NOTION_UUID, str(r.get("normalized_db")))
+        check("웹 ⚙설정: 담당자 열 4개를 즉시 반환", len(r.get("columns") or []) == 4, str(r.get("columns")))
+        check("웹 ⚙설정: 실패 사유 없음", r.get("columns_error") is None, str(r.get("columns_error")))
+        check("웹 ⚙설정: STATE['columns'] 즉시 갱신(새로고침 없이 바로 보임)",
+              web_ui.STATE["columns"] == r["columns"], str(web_ui.STATE["columns"]))
+        check("웹 ⚙설정: 파일에 _columns 저장", data.get("_columns") == r["columns"], str(data.get("_columns")))
+        st = web_ui.api_status()
+        check("웹 상태: 열 4개 · 오류 없음",
+              len(st["notion"]["columns"]) == 4 and not st["notion"].get("columns_error"), str(st["notion"])[:160])
+        check("웹 상태: 응답에 토큰 없음", "ntn_url_token" not in json.dumps(st, ensure_ascii=False))
+
+        # 5) 다른 DB 인데 못 읽으면: 이전 DB 의 열 목록을 보여 주지 않고(1개 오해 방지) 사유를 남긴다
+        locked = "41a27dbe-ffff-8193-9138-de51fa8dfb1c"
+        main._notion_http = StrictNotionStub(deny=[locked])
+        r2 = web_ui.save_notion_settings("ntn_url_token", locked, "")
+        data2 = json.loads(tmp.read_text(encoding="utf-8"))
+        check("웹 ⚙설정(실패): 저장은 하되 열 목록은 비움", r2["ok"] and r2["columns"] == [], str(r2.get("columns")))
+        check("웹 ⚙설정(실패): 사유를 응답에 담는다",
+              bool(r2.get("columns_error")) and "403" in (r2.get("columns_error") or ""), str(r2.get("columns_error")))
+        check("웹 ⚙설정(실패): 다른 DB 의 _columns 는 버린다", "_columns" not in data2, str(data2.keys()))
+        check("웹 ⚙설정(실패): STATE['columns'] = []", web_ui.STATE["columns"] == [], str(web_ui.STATE["columns"]))
+        st2 = web_ui.api_status()
+        check("웹 상태(실패): columns_error 로 이유를 알 수 있다", bool(st2["notion"].get("columns_error")), str(st2["notion"])[:160])
+
+        # 6) 실시간 읽기가 안 돼도 저장해 둔 _columns 로 고를 수 있다(폴백)
+        data2["_columns"] = ["메인.엽", "서브.동", "서브.준"]
+        tmp.write_text(json.dumps(data2, ensure_ascii=False), encoding="utf-8")
+        main._notion_http = StrictNotionStub(deny=[locked])
+        web_ui.reset_state()
+        cols_fb = web_ui.notion_columns()
+        check("폴백: 저장해 둔 열 목록을 쓴다", cols_fb == ["메인.엽", "서브.동", "서브.준"], str(cols_fb))
+        check("폴백: 화면에 '저장해 둔 열' 안내", "저장해 둔 열" in (web_ui.STATE.get("columns_error") or ""),
+              str(web_ui.STATE.get("columns_error")))
+
+        # 7) [↻ 새로고침]: 권한이 풀린 뒤 다시 읽으면 5개가 돌아오고 오류가 사라진다
+        main._notion_http = StrictNotionStub()
+        rr = web_ui.reload_columns()
+        check("새로고침: 4개를 다시 읽음", rr["ok"] and len(rr["columns"]) == 4, str(rr)[:160])
+        check("새로고침: 오류 표시가 지워짐", web_ui.STATE.get("columns_error") is None,
+              str(web_ui.STATE.get("columns_error")))
+        check("새로고침: 로그에 남김", any("담당자 열 새로고침" in l for l in web_ui.log_payload(0)["lines"]), "")
+        main._notion_http = StrictNotionStub(deny=[locked])
+        rr2 = web_ui.reload_columns()
+        check("새로고침(실패): ok=false · 사유 반환", rr2["ok"] is False and bool(rr2["error"]), str(rr2)[:160])
+
+        # 8) HTTP 로 실제 [↻ 새로고침] 을 눌렀을 때
+        main._notion_http = StrictNotionStub()
+        web_ui.reset_state()
+        httpd = web_ui.make_server("127.0.0.1", 0)
+        port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/api/notion-columns",
+                                         data=b"{}", headers={"Content-Type": "application/json"},
+                                         method="POST")
+            out = json.loads(urllib.request.urlopen(req, timeout=15).read().decode("utf-8"))
+            check("웹 /api/notion-columns: 200 · 열 4개",
+                  out.get("ok") is True and len(out.get("columns") or []) == 4, str(out)[:160])
+            check("웹 /api/notion-columns: 토큰 미노출", "ntn_" not in json.dumps(out, ensure_ascii=False))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=3)
+
+        # 9) 화면에 담당자 열 옆 [↻ 새로고침] 버튼과 오류 표시
+        html = web_ui.PAGE_HTML
+        check("웹 화면: [↻ 새로고침] 버튼", 'id="btnReloadCols"' in html and "새로고침" in html)
+        check("웹 화면: 담당자 열 select 바로 옆에 버튼",
+              html.index('id="btnReloadCols"') > html.index('id="column"')
+              and html.index('id="btnReloadCols"') - html.index('id="column"') < 400, "")
+        check("웹 화면: columns_error 를 표시", "columns_error" in html and "columnBanner" in html)
+        check("웹 화면: 열 개수 힌트", "담당자 열 ${cols.length}개" in html, "")
+        check("웹 API: /api/notion-columns 라우트", '"/api/notion-columns"' in read(), "")
+
+        # 10) CLI 설정 마법사도 주소를 받아 ID 만 저장한다
+        tmp.unlink(missing_ok=True)
+        main._notion_http = StrictNotionStub()
+        buf = io.StringIO()
+        with use_input(["ntn_setup_url", NOTION_URL, ""]) as fake:
+            with contextlib.redirect_stdout(buf):
+                cfg = main.setup_notion(path=str(tmp))
+        saved_file = json.loads(tmp.read_text(encoding="utf-8")) if tmp.is_file() else {}
+        printed = buf.getvalue()
+        check("CLI 설정: 주소 → 정규화된 DB ID 저장", saved_file.get("db_id") == NOTION_UUID,
+              str(saved_file.get("db_id")))
+        check("CLI 설정: 주소에서 추출했다고 알림", "주소에서 DB ID 만 추출" in printed, printed[:200])
+        check("CLI 설정: 열 번호를 물어 고른다", "참가자 열" in printed and bool(cfg))
+        check("CLI 설정: 주소로도 열 4개를 읽음", len(saved_file.get("_columns") or []) == 4,
+              str(saved_file.get("_columns")))
+        check("CLI 설정: 파일에 URL 이 남지 않음", "notion.so" not in json.dumps(saved_file, ensure_ascii=False))
+
+        # 11) 설정 파일에 주소가 직접 적혀 있어도 읽을 때 정리된다
+        tmp.write_text(json.dumps({"enabled": True, "token": "ntn_manual", "db_id": NOTION_URL,
+                                   "column": "서브.준"}), encoding="utf-8")
+        cfg_manual = main.load_notion_config()
+        check("수동 편집: 파일의 주소도 ID 로 정리해 읽음",
+              cfg_manual and cfg_manual["db_id"] == NOTION_UUID, str((cfg_manual or {}).get("db_id")))
+        check("수동 편집: 그 설정으로 열 목록을 읽음",
+              len(main.notion_list_columns(cfg_manual["db_id"], cfg_manual["token"],
+                                           transport=StrictNotionStub()) or []) == 4)
+
+        # 12) 토큰만 있으면 DB 를 자동으로 찾는다(POST /v1/search) — DB ID 입력은 선택
+        db_a = {"id": NOTION_UUID, "title": "🎁 카카오 체험단 응모 현황표",
+                "properties": NOTION_SCHEMA_TEN}
+        db_b = {"id": "51b27dbe-a669-8193-9138-de51fa8dfb1c", "title": "서브 기록장",
+                "properties": {"이름": {"type": "title"}, "서브.동": {"type": "rich_text"}}}
+        db_c = {"id": "61c27dbe-a669-8193-9138-de51fa8dfb1c", "title": "할 일",
+                "properties": {"이름": {"type": "title"}, "상태": {"type": "select"}}}
+        sdb = StrictNotionStub(databases=[db_a, db_b, db_c])
+        main._notion_http = sdb
+        found = main.notion_discover_databases("ntn_auto")
+        check("자동 찾기: 연결된 DB 3개를 찾음", found is not None and len(found) == 3,
+              str(found)[:160])
+        check("자동 찾기: DB 이름·담당자 열까지 함께 읽음",
+              [len(d["columns"]) for d in (found or [])] == [4, 1, 0]
+              and (found or [{}])[0]["title"].startswith("🎁"), str([(d["title"], len(d["columns"])) for d in (found or [])]))
+        check("자동 찾기: 검색은 database 필터 · page_size 20",
+              (sdb.searches or [{}])[0].get("filter") == {"property": "object", "value": "database"}
+              and (sdb.searches or [{}])[0].get("page_size") == 20, str(sdb.searches[:1]))
+        pick = main.pick_notion_database(found)
+        check("자동 선택: 담당자 열·'체험단' 이름 기준으로 현황표 DB", pick and pick["id"] == db_a["id"],
+              str((pick or {}).get("title")))
+        check("자동 선택: 저장된 DB 가 후보에 있으면 그 DB 유지",
+              (main.pick_notion_database(found, prefer_id=db_b["id"]) or {}).get("id") == db_b["id"])
+        check("자동 선택: 담당자 열이 있는 DB 가 없으면 None",
+              main.pick_notion_database([dict(db_c)]) is None)
+        check("자동 찾기: 검색 실패는 스키마 오류와 섞이지 않는다",
+              main.notion_discover_databases("ntn_x", transport=StrictNotionStub()) is None
+              and "DB 목록 조회 실패" in (main.notion_last_search_error() or ""),
+              str(main.notion_last_search_error()))
+
+        # 12-2) DB 목록을 아직 못 읽은 설정에서도 지금 쓰는 DB 는 [DB] 칸에 보인다
+        tmp.write_text(json.dumps({"enabled": True, "token": "ntn_bare", "db_id": NOTION_UUID,
+                                   "column": "메인.엽"}, ensure_ascii=False), encoding="utf-8")
+        web_ui.reset_state()
+        st_bare = web_ui.api_status()["notion"]
+        check("웹 상태: DB 목록이 없으면 저장된 DB 1개로 표시",
+              len(st_bare["databases"]) == 1 and st_bare["databases"][0]["current"] is True,
+              str(st_bare["databases"]))
+        check("웹 상태: 저장된 DB 표시에 토큰 없음", "ntn_bare" not in json.dumps(st_bare, ensure_ascii=False),
+              str(st_bare["databases"]))
+
+        # 13) 웹: 토큰만 넣고 저장 → DB 자동 선택 · 목록 기억
+        tmp.write_text(json.dumps({"enabled": True, "token": "ntn_old", "db_id": "db-old",
+                                   "column": "메인.엽"}), encoding="utf-8")
+        main._notion_http = StrictNotionStub(databases=[db_a, db_b, db_c])
+        web_ui.reset_state()
+        r = web_ui.save_notion_settings("ntn_token_only", "")
+        data = json.loads(tmp.read_text(encoding="utf-8"))
+        check("웹 토큰만: DB ID 없이 저장 성공", r["ok"] is True and data["db_id"] == db_a["id"],
+              str(data.get("db_id")))
+        check("웹 토큰만: 고른 DB 를 안내", "체험단" in (r.get("note") or ""), str(r.get("note")))
+        check("웹 토큰만: 담당자 열 4개를 바로 채움", len(r.get("columns") or []) == 4, str(r.get("columns")))
+        check("웹 토큰만: 연결된 DB 목록을 기억", len(data.get("_databases") or []) == 3,
+              str(len(data.get("_databases") or [])))
+        check("웹 토큰만: DB ID 칸 비워도 안내 문구 없음", not r.get("columns_error"), str(r.get("columns_error")))
+        st = web_ui.api_status()
+        dbs = st["notion"]["databases"]
+        check("웹 상태: DB 목록 3개 · 현재 DB 표시",
+              len(dbs) == 3 and [d["current"] for d in dbs] == [True, False, False], str(dbs))
+        check("웹 상태: DB 이름 전달", dbs[0]["title"].startswith("🎁") and dbs[2]["columns"] == 0, str(dbs))
+        check("웹 상태: 토큰 미노출", "ntn_token_only" not in json.dumps(st, ensure_ascii=False))
+
+        # 14) 웹: [DB] 를 바꾸면 그 DB 기준으로 담당자 열을 다시 읽는다
+        r_sw = web_ui.switch_notion_db(db_b["id"])
+        data = json.loads(tmp.read_text(encoding="utf-8"))
+        check("DB 바꾸기: db_id·열 목록 교체", r_sw["ok"] and data["db_id"] == db_b["id"]
+              and r_sw["columns"] == ["서브.동"], str(r_sw)[:160])
+        check("DB 바꾸기: 저장된 열이 새 DB 에 없으면 첫 열로", data["column"] == "서브.동",
+              str(data.get("column")))
+        check("DB 바꾸기: api_status 현재 DB 표시",
+              [d["current"] for d in web_ui.api_status()["notion"]["databases"]] == [False, True, False])
+        r_sw2 = web_ui.switch_notion_db(db_a["id"])
+        check("DB 바꾸기: 되돌리기", r_sw2["ok"] and len(r_sw2["columns"]) == 4, str(r_sw2)[:120])
+
+        # 15) 웹: DB 를 못 찾으면 안내만 하고, 토큰은 저장해 두어 [↻ DB 목록]으로 이어 간다
+        tmp.write_text(json.dumps({"enabled": False}), encoding="utf-8")
+        main._notion_http = StrictNotionStub(databases=None)
+        r_no = web_ui.save_notion_settings("ntn_lonely", "")
+        data = json.loads(tmp.read_text(encoding="utf-8"))
+        check("웹 못 찾음: 저장 실패로 안내", r_no["ok"] is False
+              and "API 연결(Integration)" in (r_no.get("error") or ""), str(r_no.get("error")))
+        check("웹 못 찾음: 토큰은 저장해 둠", r_no.get("token_saved") is True and data["token"] == "ntn_lonely"
+              and data["db_id"] == "", str(data))
+        check("웹 못 찾음: 상태에 안내", "DB ID 가 아직 비어 있습니다" in (web_ui.api_status()["notion"]["columns_error"] or ""),
+              str(web_ui.api_status()["notion"]["columns_error"]))
+        web_ui.reset_state()
+        pv_no_db = web_ui.preview("notion", 5)
+        check("웹 못 찾음: 미리보기는 [↻ DB 목록] 안내", pv_no_db["ok"] is False
+              and "DB 목록" in (pv_no_db.get("error") or ""), str(pv_no_db.get("error")))
+        main._notion_http = StrictNotionStub(databases=[db_a])
+        rr = web_ui.refresh_databases()
+        data = json.loads(tmp.read_text(encoding="utf-8"))
+        check("DB 목록 새로고침: 찾은 DB 로 자동 이어감", rr["ok"] and data["db_id"] == db_a["id"]
+              and len(data.get("_columns") or []) == 4, str(rr)[:160])
+        check("DB 목록 새로고침: 안내 문구", "골라 저장" in (rr.get("note") or ""), str(rr.get("note")))
+        main._notion_http = StrictNotionStub(databases=[])
+        rr_none = web_ui.refresh_databases()
+        check("DB 목록 새로고침(0개): ⋯ → 연결 안내", rr_none["ok"] is False
+              and "⋯ → 연결" in (rr_none.get("error") or ""), str(rr_none.get("error")))
+        main._notion_http = StrictNotionStub(databases=None)
+        rr_err = web_ui.refresh_databases()
+        check("DB 목록 새로고침(검색 실패): 사유 전달", rr_err["ok"] is False
+              and "DB 목록 조회 실패" in (rr_err.get("error") or ""), str(rr_err.get("error")))
+
+        # 16) 화면: DB ID 는 선택 입력 · [DB] 선택과 [↻ DB 목록] 제공
+        html = web_ui.PAGE_HTML
+        check("웹 화면: DB ID '안 넣어도 됨' 안내", "안 넣어도 됨" in html and "토큰으로 자동 찾기" in html)
+        check("웹 화면: [DB] 선택 · [↻ DB 목록] 버튼", 'id="dbSelect"' in html and 'id="btnReloadDbs"' in html)
+        check("웹 화면: DB 목록을 그린다", "n.databases" in html and "d.current" in html)
+        py = read()
+        check("웹 API: /api/notion-db · /api/notion-dbs 라우트",
+              '"/api/notion-db"' in py and '"/api/notion-dbs"' in py)
+        js_ids = set(re.findall(r'\$\("([A-Za-z0-9_]+)"\)', html.split("<script>")[1]))
+        html_ids = set(re.findall(r'id="([A-Za-z0-9_]+)"', html))
+        check("웹 화면: 스크립트가 쓰는 id 가 모두 화면에 있다", not (js_ids - html_ids), str(sorted(js_ids - html_ids)))
+        main_src = Path(main.__file__).read_text(encoding="utf-8")
+        check("main: /v1/search 로 DB 를 찾는 함수", "def notion_discover_databases" in main_src
+              and 'tr("POST", "/search"' in main_src)
+
+        # 17) CLI: DB ID Enter → 토큰으로 자동 찾아 저장
+        tmp.unlink(missing_ok=True)
+        main._notion_http = StrictNotionStub(databases=[db_a, db_b, db_c])
+        buf = io.StringIO()
+        with use_input(["ntn_cli_auto", "", ""]):
+            with contextlib.redirect_stdout(buf):
+                cfg_auto = main.setup_notion(path=str(tmp))
+        saved_auto = json.loads(tmp.read_text(encoding="utf-8")) if tmp.is_file() else {}
+        printed = buf.getvalue()
+        check("CLI 자동: DB ID 없이 저장", saved_auto.get("db_id") == db_a["id"], str(saved_auto.get("db_id")))
+        check("CLI 자동: 어떤 DB 를 골랐는지 알림", "[자동 선택]" in printed, printed[-300:])
+        check("CLI 자동: 여러 개라 기본 선택했다고 알림", "기본으로 골랐습니다" in printed, printed[-200:])
+        check("CLI 자동: 찾은 DB 목록을 기억", len(saved_auto.get("_databases") or []) == 3)
+        check("CLI 자동: 열 목록도 저장", len(saved_auto.get("_columns") or []) == 4)
+        check("CLI 자동: 설정 반환", bool(cfg_auto) and cfg_auto["db_id"] == db_a["id"])
+
+        # 18) CLI: DB 를 못 찾고 저장된 DB 도 없으면 안내하고 멈춘다
+        tmp.unlink(missing_ok=True)
+        main._notion_http = StrictNotionStub(databases=None)
+        saved_default = main.NOTION_DEFAULT_DB_ID
+        main.NOTION_DEFAULT_DB_ID = ""
+        try:
+            buf = io.StringIO()
+            with use_input(["ntn_cli_none", ""]):
+                with contextlib.redirect_stdout(buf):
+                    cfg_none = main.setup_notion(path=str(tmp))
+            check("CLI 못 찾음: 안내하고 멈춤", cfg_none is None and not tmp.exists()
+                  and "API 연결(Integration)을 DB 페이지에 추가" in buf.getvalue(), buf.getvalue()[-200:])
+        finally:
+            main.NOTION_DEFAULT_DB_ID = saved_default
+    finally:
+        main._notion_http = saved["http"]
+        main.NOTION_SECRET_FILE = saved["secret"]
+        main.notion_list_columns = saved["columns"]
+        main.NOTION_LAST_ERROR.update({"db_id": None, "message": None})
+        main.NOTION_LAST_SEARCH_ERROR.update({"message": None})
+        tmp.unlink(missing_ok=True)
+        web_ui.reset_state()
+
+
 if __name__ == "__main__":
     test_filter()
     test_apply_flow()
@@ -1584,6 +1953,7 @@ if __name__ == "__main__":
     test_notion_once()
     test_onestop()
     test_logout()
+    test_column_discovery()
     cleanup()
     print()
     if FAILS:

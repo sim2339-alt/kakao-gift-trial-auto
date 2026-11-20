@@ -100,6 +100,18 @@ NOTION_TIMEOUT = 15
 NOTION_TEXT_MAX = 2000
 # 참가자 열이 아닌 rich_text 메타 열(설정 시 열 목록에서 잴 제외)
 NOTION_META_COLUMNS = ("단계", "옵션", "메커니즘", "마감일·모집현황")
+# 노션 ID 형태: 하이픈 없는 32자 hex 또는 8-4-4-4-12 UUID.
+# 웹 UI·설정에 페이지/DB 전체 URL 을 붙여넣어도 여기서 ID 만 뽑아 쓴다.
+NOTION_ID_RE = re.compile(
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r"|[0-9a-fA-F]{32})")
+# 마지막으로 실패한 노션 스키마 조회 사유(웹 화면의 '열 목록을 못 읽음' 안내에 쓴다)
+NOTION_LAST_ERROR: dict = {"db_id": None, "message": None}
+# DB 목록 검색(POST /v1/search) 실패 사유 — 스키마 조회 실패(NOTION_LAST_ERROR)와 섞이지 않게 따로 둔다
+NOTION_LAST_SEARCH_ERROR: dict = {"message": None}
+# DB ID 를 모를 때: 토큰으로 연결된 DB 를 찾는다(POST /v1/search)
+NOTION_SEARCH_PAGE_SIZE = 20
+NOTION_SEARCH_PAGES_MAX = 3
 
 # 신청 개수 기본값 (대화형 실행에서 Enter 만 눌렀을 때)
 LIMIT_DEFAULT = 100
@@ -559,6 +571,42 @@ def save_results_csv(results: list, path: Path | None = None) -> Path:
 #   notion_secret.json 이 없거나 "enabled": false 면 조용히 건너뛰고 CSV 저장만 한다.
 #   네트워크·노션 오류는 신청 루프를 죽이지 않는다(결과 요약에 성공/실패 건수만 남김).
 # ---------------------------------------------------------------------------
+def normalize_notion_db_id(value: str) -> str:
+    """노션 DB ID 를 8-4-4-4-12 형태로 정리한다.
+
+    사용자가 웹 UI·설정에 아래 어느 형태를 붙여넣어도 같은 DB 로 읽히게 한다.
+      · https://www.notion.so/워크스페이스/41a27dbea66981939138de51fa8dfb1c?v=...
+      · notion.so/...?pvs=4 (쿼리·앵커 포함)
+      · 41a27dbea66981939138de51fa8dfb1c (하이픈 없는 32자)
+      · 41a27dbe-a669-8193-9138-de51fa8dfb1c (이미 정리된 UUID)
+
+    ID 를 못 찾으면(예: 'db-once', 빈 값) 입력값을 그대로 돌려준다 — 조회가 실패하면
+    그 사유가 화면에 그대로 드러나게 하기 위해서다.
+    """
+    text = str(value or "").strip().strip('"\'').strip()
+    if not text:
+        return ""
+    # URL 이면 쿼리(?v=...)·앵커(#...)를 떼고 경로에서 먼저 찾는다(뷰 ID 와 헷갈리지 않게).
+    head = text.split("?", 1)[0].split("#", 1)[0]
+    match = NOTION_ID_RE.search(head)
+    if match is None:
+        match = NOTION_ID_RE.search(text)
+    if match is None:
+        return text
+    hex32 = match.group(1).replace("-", "").lower()
+    return f"{hex32[0:8]}-{hex32[8:12]}-{hex32[12:16]}-{hex32[16:20]}-{hex32[20:32]}"
+
+
+def notion_last_error() -> str | None:
+    """마지막 노션 DB 스키마 조회 실패 사유(성공했으면 None)."""
+    return NOTION_LAST_ERROR.get("message")
+
+
+def notion_last_search_error() -> str | None:
+    """마지막 노션 DB 목록 검색 실패 사유(성공했으면 None)."""
+    return NOTION_LAST_SEARCH_ERROR.get("message")
+
+
 def load_notion_config(path: str | None = None, column: str | None = None) -> dict | None:
     """notion_secret.json 을 읽는다. 파일이 없거나 enabled=false 면 None(기록 안 함).
 
@@ -576,13 +624,16 @@ def load_notion_config(path: str | None = None, column: str | None = None) -> di
     if not isinstance(cfg, dict) or cfg.get("enabled", True) is False:
         return None
     token = str(cfg.get("token") or "").strip()
-    db_id = str(cfg.get("db_id") or "").strip()
+    # 파일에 URL 이나 하이픈 없는 32자로 들어 있어도 그대로 동작하게 정리해서 쓴다
+    db_id = normalize_notion_db_id(cfg.get("db_id"))
     if not token or not db_id:
         print(f"[경고] {p.name} 에 token/db_id 가 비어 있습니다. 노션 기록을 건너뜁니다.")
         return None
     col = str(column or cfg.get("column") or NOTION_DEFAULT_COLUMN).strip() or NOTION_DEFAULT_COLUMN
     cached = [str(c).strip() for c in (cfg.get("_columns") or []) if str(c).strip()]
-    return {"token": token, "db_id": db_id, "column": col, "file": str(p), "columns": cached}
+    databases = [d for d in (cfg.get("_databases") or []) if isinstance(d, dict) and d.get("id")]
+    return {"token": token, "db_id": db_id, "column": col, "file": str(p),
+            "columns": cached, "databases": databases}
 
 
 def notion_secret_state(path: str | None = None) -> str:
@@ -998,34 +1049,136 @@ def ask_yes(prompt: str) -> bool:
     return raw in ("y", "yes", "예", "네", "1")
 
 
-def notion_list_columns(db_id: str, token: str, transport=None) -> list[str] | None:
-    """노션 DB 스키마를 읽어 '기록할 참가자 열' 후보 rich_text 열을 돌려준다.
+def _participant_columns(properties: dict | None) -> list[str]:
+    """노션 DB properties → '기록할 담당자 열' 후보(rich_text) 목록.
 
     메타 열(옵션·메커니즘·마감일·모집현황)은 제외하고, 기본 열(메인.엽)을 맨 앞에 둔다.
-    읽지 못하면 None.
     """
-    tr = transport or _notion_http
-    status, data, err = tr("GET", f"/databases/{db_id}", None, token)
-    if status != 200 or not isinstance(data, dict):
-        print(f"[경고] 노션 DB 스키마 조회 실패({_notion_err(data, status, err)})")
-        return None
     cols = []
-    for name, prop in (data.get("properties") or {}).items():
+    for name, prop in (properties or {}).items():
         if (prop or {}).get("type") != "rich_text":
             continue
         if name in NOTION_META_COLUMNS:
             continue
         cols.append(name)
-    if not cols:
-        return None
     cols.sort(key=lambda n: (0 if n == NOTION_DEFAULT_COLUMN else 1, n))
     return cols
+
+
+def notion_columns_detail(db_id: str, token: str, transport=None) -> dict:
+    """노션 DB 스키마를 읽어 (참가자 열 후보, 실패 사유)를 함께 돌려준다.
+
+    돌려주는 dict: {"columns": list | None, "error": str | None}
+      · columns 가 목록  → 읽음(실패 사유 없음)
+      · columns 가 []    → DB 는 읽혔는데 참가자 rich_text 열이 없음
+      · columns 가 None  → 스키마 조회 자체가 실패(토큰·DB ID·연결 권한)
+    """
+    db_id = normalize_notion_db_id(db_id)
+    tr = transport or _notion_http
+    status, data, err = tr("GET", f"/databases/{db_id}", None, token)
+    if status != 200 or not isinstance(data, dict):
+        message = f"노션 DB 스키마 조회 실패({_notion_err(data, status, err)})"
+        print(f"[경고] {message}")
+        NOTION_LAST_ERROR.update({"db_id": db_id, "message": message})
+        return {"columns": None, "error": message}
+    cols = _participant_columns(data.get("properties"))
+    if not cols:
+        message = "이 DB 에 담당자(rich_text) 열이 없습니다 — DB ID 를 확인해 주세요."
+        print(f"[경고] {message}")
+        NOTION_LAST_ERROR.update({"db_id": db_id, "message": message})
+        return {"columns": [], "error": message}
+    NOTION_LAST_ERROR.update({"db_id": db_id, "message": None})
+    return {"columns": cols, "error": None}
+
+
+def notion_list_columns(db_id: str, token: str, transport=None) -> list[str] | None:
+    """노션 DB 스키마를 읽어 '기록할 참가자 열' 후보 rich_text 열을 돌려준다.
+
+    읽지 못하면 None(실패 사유는 notion_last_error() 로 볼 수 있다).
+    DB ID 는 URL·32자 형태로 들어와도 normalize_notion_db_id() 가 정리한다.
+    """
+    return notion_columns_detail(db_id, token, transport).get("columns")
+
+
+def _notion_title(obj: dict) -> str:
+    """노션 객체의 title 배열 → 문자열."""
+    title = (obj or {}).get("title")
+    if isinstance(title, str):
+        return title.strip()
+    parts = []
+    for chunk in title or []:
+        if isinstance(chunk, dict):
+            parts.append(chunk.get("plain_text") or (chunk.get("text") or {}).get("content") or "")
+    return "".join(parts).strip()
+
+
+def notion_discover_databases(token: str, transport=None,
+                             page_size: int = NOTION_SEARCH_PAGE_SIZE) -> list[dict] | None:
+    """토큰(API 연결)만으로 '이 통합이 연결된 노션 DB'를 찾는다 — POST /v1/search.
+
+    DB ID 를 몰라도 되게 하려는 것: 사용자는 노션에서 통합을 DB 화면 ⋯ → 연결 에
+    추가해 두기만 하면 되고, 여기서 그 DB 들의 id·title·담당자 열까지 한 번에 읽는다.
+    돌려주는 값: [{"id", "title", "columns"}] · 검색이 실패하면 None.
+    """
+    tr = transport or _notion_http
+    found, seen, cursor = [], set(), None
+    for _page in range(NOTION_SEARCH_PAGES_MAX):
+        payload = {"filter": {"property": "object", "value": "database"},
+                   "page_size": max(1, min(int(page_size or NOTION_SEARCH_PAGE_SIZE), 100))}
+        if cursor:
+            payload["start_cursor"] = cursor
+        status, data, err = tr("POST", "/search", payload, token)
+        if status != 200 or not isinstance(data, dict):
+            message = f"노션 DB 목록 조회 실패({_notion_err(data, status, err)})"
+            print(f"[경고] {message}")
+            NOTION_LAST_SEARCH_ERROR.update({"message": message})
+            return None
+        for db in data.get("results") or []:
+            if not isinstance(db, dict):
+                continue
+            db_id = normalize_notion_db_id(db.get("id"))
+            if not db_id or db_id in seen:
+                continue
+            seen.add(db_id)
+            found.append({"id": db_id, "title": _notion_title(db) or "(제목 없는 DB)",
+                          "columns": _participant_columns(db.get("properties"))})
+        cursor = data.get("next_cursor")
+        if not data.get("has_more") or not cursor:
+            break
+    NOTION_LAST_SEARCH_ERROR.update({"message": None})
+    return found
+
+
+def pick_notion_database(databases: list[dict] | None, prefer_id: str | None = None) -> dict | None:
+    """발견한 DB 중 '담당자 열이 있는' DB 하나를 기본으로 고른다.
+
+    여럿이면 ① 기본 열(메인.엽)이 있는 DB ② 이름에 '체험단'이 들어간 DB ③ 담당자 열이 많은 DB 순.
+    prefer_id(지금 저장된 DB)가 후보에 있으면 그 DB 를 먼저 쓴다(설정을 바꿔도 쓰던 DB 유지).
+    """
+    usable = [d for d in (databases or []) if d.get("columns")]
+    if not usable:
+        return None
+    prefer = normalize_notion_db_id(prefer_id) if prefer_id else ""
+    if prefer:
+        for db in usable:
+            if db.get("id") == prefer:
+                return db
+
+    def score(db: dict):
+        cols = db.get("columns") or []
+        return (1 if NOTION_DEFAULT_COLUMN in cols else 0,
+                1 if "체험단" in (db.get("title") or "") else 0,
+                len(cols))
+
+    return sorted(usable, key=lambda db: (score(db), db.get("title") or ""))[-1]
 
 
 def setup_notion(path: str | None = None, transport=None) -> dict | None:
     """notion_secret.json 을 대화형으로 만든다(설정 변경용).
 
-    순서: ① API 토큰 → ② DB ID(Enter 시 기본값) → ③ DB 스키마를 읽어 참가자 열을 번호로 고르기.
+    순서: ① API 토큰 → ② DB ID(Enter = 토큰으로 자동 찾기) → ③ DB 스키마를 읽어 참가자 열을 번호로 고르기.
+    DB ID 는 몰라도 된다 — 토큰만 주면 이 통합(Integration)이 연결된 DB 를 찾아
+    담당자 rich_text 열이 있는 DB 를 자동으로 고른다(여럿이면 가장 맞는 DB를 기본으로).
     이미 저장된 설정이 있으면 그 값이 기본값이 되어, 바꾸려는 항목만 입력하면 된다.
     저장한 파일은 .gitignore 에 등록되어 있어 커밋되지 않는다.
     이 화면은 '설정 변경'용이고, 실행할 때는 토큰·DB ID 를 묻지 않는다.
@@ -1064,17 +1217,40 @@ def setup_notion(path: str | None = None, transport=None) -> dict | None:
         print("[안내] 토큰이 입력되지 않아 설정을 만들지 않았습니다.")
         return None
 
-    db_default = str(old.get("db_id") or NOTION_DEFAULT_DB_ID).strip()
-    hint = f" (그냥 Enter = {db_default})" if db_default else ""
+    db_default = normalize_notion_db_id(old.get("db_id") or NOTION_DEFAULT_DB_ID)
+    hint = " (그냥 Enter = 토큰으로 자동 찾기" + (f" / 저장된 DB {db_default[-6:]}" if db_default else "") + ")"
     try:
         raw = input(f"노션 DB ID{hint}: ").strip()
     except (EOFError, KeyboardInterrupt):
         print()
         return None
-    db_id = raw or db_default
+    db_id = normalize_notion_db_id(raw)
+    if raw and db_id != raw:
+        # 페이지/DB 전체 URL 을 붙여넣은 경우 — ID 만 뽑아 저장한다(이걸 그대로 쓰면 조회가 실패한다)
+        print(f"[안내] 붙여넣은 주소에서 DB ID 만 추출했습니다: {db_id}")
+
+    databases: list[dict] = []
     if not db_id:
-        print("[안내] DB ID 가 없어 설정을 만들지 않았습니다.")
-        return None
+        # ②-2) DB ID 를 몰라도 된다 — 토큰으로 연결된 DB 를 찾아 고른다
+        print("[안내] DB ID 없이 진행 — 토큰으로 연결된 노션 DB 를 찾습니다…")
+        databases = notion_discover_databases(token, tr) or []
+        usable = [d for d in databases if d.get("columns")]
+        pick = pick_notion_database(databases, prefer_id=db_default)
+        if pick:
+            db_id = pick["id"]
+            print(f"[자동 선택] '{pick.get('title')}' DB · 담당자 열 {len(pick.get('columns') or [])}개")
+            if len(usable) > 1:
+                print(f"   연결된 DB 가 {len(usable)}개라 가장 맞는 DB 를 기본으로 골랐습니다"
+                      " — 바꾸려면 웹 조종판 ⚙ 설정 변경의 [연결된 DB]에서 고르세요.")
+                for db in usable[:5]:
+                    print(f"     · {db.get('title')}")
+        elif db_default:
+            db_id = db_default
+            print(f"[안내] 노션에서 DB 를 자동으로 찾지 못해 저장된 DB ID 로 진행합니다: {db_id}")
+        else:
+            print("[안내] 노션에서 이 API 연결(Integration)을 DB 페이지에 추가했는지 확인해 주세요.")
+            print("       (노션 DB 화면 오른쪽 위 ⋯ → 연결 에서 통합을 추가한 뒤 다시 실행하세요.)")
+            return None
 
     # ③ 스키마를 읽어 참가자 열을 번호로 고른다.
     column = str(old.get("column") or NOTION_DEFAULT_COLUMN).strip() or NOTION_DEFAULT_COLUMN
@@ -1099,6 +1275,8 @@ def setup_notion(path: str | None = None, transport=None) -> dict | None:
                 break
             print("  목록에 있는 번호를 입력해 주세요.")
     else:
+        reason = notion_last_error() or "노션에서 열 목록을 읽지 못했습니다"
+        print(f"[안내] {reason} — 참가자 열 이름을 직접 적어 주세요.")
         try:
             raw = input(f" 참가자 열 이름 (그냥 Enter = {column}): ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -1107,10 +1285,17 @@ def setup_notion(path: str | None = None, transport=None) -> dict | None:
         column = raw or column
 
     cfg = dict(old) if isinstance(old, dict) else {}
+    db_changed = bool(str(old.get("db_id") or "").strip()) and \
+        normalize_notion_db_id(old.get("db_id")) != db_id
     cfg.update({"enabled": True, "token": token, "db_id": db_id, "column": column})
     cfg.pop("_단계", None)
     if cols:
         cfg["_columns"] = list(cols)   # 열 목록을 기억해 두면 다음에 노션 읽기가 잠시 안 돼도 열을 고를 수 있다
+    elif db_changed:
+        cfg.pop("_columns", None)     # 다른 DB 로 바뀌었는데 못 읽었으면 이전 DB 의 열 목록은 버린다
+    if databases:
+        cfg["_databases"] = [{"id": d.get("id"), "title": d.get("title"), "columns": list(d.get("columns") or [])}
+                             for d in databases]   # 다음에 웹에서 DB 를 바꿀 수 있게 찾은 목록을 기억한다
     p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     try:
         os.chmod(p, 0o600)   # 이 파일에는 토큰이 들어 있다
@@ -1134,6 +1319,9 @@ def ask_notion_column(cfg: dict, transport=None) -> str:
     cols = notion_list_columns(cfg["db_id"], cfg["token"], transport)
     if not cols:
         cols = [str(c) for c in (cfg.get("columns") or []) if str(c).strip()]
+        if cols:
+            print(f"[안내] 노션에서 열 목록을 읽지 못했습니다({notion_last_error() or '연결 확인 필요'})."
+                  f" 저장해 둔 열 {len(cols)}개로 고릅니다.")
     choices = [saved] + [c for c in cols if c != saved]
     if len(choices) <= 1:
         print(f"[노션] 기록할 담당자 열: '{saved}' (저장된 열 그대로 · 다시 묻지 않음)")

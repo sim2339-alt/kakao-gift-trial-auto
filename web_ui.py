@@ -31,7 +31,7 @@ from pathlib import Path
 
 import main
 
-APP_VERSION = "2.3"
+APP_VERSION = "2.4"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 LOG_MAX = 4000          # 로그 창에 보관할 최대 줄 수
@@ -57,6 +57,7 @@ STATE = {
     "login": None,           # 마지막으로 확인한 로그인 상태
     "login_checked_at": None,
     "columns": None,         # 노션 참가자 열 목록(한 번 읽어 캐시)
+    "columns_error": None,   # 열 목록을 못 읽은 사유(화면에 그대로 보여 준다)
 }
 
 
@@ -65,7 +66,8 @@ def reset_state():
     with STATE["lock"]:
         STATE.update({"job": None, "console": [], "phase": "idle", "started_at": None,
                       "finished_at": None, "summary": None, "proc": None,
-                      "login": None, "login_checked_at": None, "columns": None})
+                      "login": None, "login_checked_at": None, "columns": None,
+                      "columns_error": None})
 
 
 def add_line(line: str):
@@ -173,31 +175,24 @@ def remember_column(column: str | None) -> None:
         save_column(column)
 
 
-def save_notion_settings(token: str, db_id: str, column: str = "") -> dict:
-    """⚙ 설정 변경(접힘 메뉴): 토큰·DB ID·담당자 열을 저장한다. 토큰은 화면으로 돌려주지 않는다.
+def _public_databases(entries, current_id: str = "") -> list:
+    """저장해 둔 DB 목록 → 화면에 보낼 모양(토큰 없음)."""
+    out = []
+    current = main.normalize_notion_db_id(current_id)
+    for db in entries or []:
+        if not isinstance(db, dict):
+            continue
+        db_id = main.normalize_notion_db_id(db.get("id"))
+        if not db_id:
+            continue
+        cols = [str(c).strip() for c in (db.get("columns") or []) if str(c).strip()]
+        out.append({"id": db_id, "title": str(db.get("title") or "(제목 없는 DB)"),
+                    "columns": len(cols), "current": db_id == current})
+    return out
 
-    한 번 저장해 두면 실행할 때는 토큰·DB ID 를 다시 묻지 않고 담당자 열만 고른다.
-    """
-    token = (token or "").strip()
-    db_id = (db_id or "").strip()
-    if not token or not db_id:
-        return {"ok": False, "error": "노션 API 토큰과 DB ID 를 모두 넣어 주세요."}
-    old = read_secret()
-    old_token = str(old.get("token") or "").strip()
-    old_db = str(old.get("db_id") or "").strip()
-    col = (column or "").strip() or str(old.get("column") or main.NOTION_DEFAULT_COLUMN).strip()
-    cols = main.notion_list_columns(db_id, token) or []
-    note = ""
-    if cols:
-        if col not in cols:
-            col = cols[0]
-    elif not (token == old_token and db_id == old_db):
-        note = "저장은 했지만 노션에서 열 목록을 확인하지 못했습니다(토큰·DB ID·DB 연결 권한을 확인해 주세요)."
-    data = dict(old)
-    data.update({"enabled": True, "token": token, "db_id": db_id, "column": col})
-    data.pop("_단계", None)
-    if cols:
-        data["_columns"] = list(cols)
+
+def _write_secret(data: dict) -> str | None:
+    """notion_secret.json 저장(토큰이 든 파일이라 권한 600). 실패 사유를 돌려준다."""
     p = secret_path()
     try:
         p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -206,10 +201,190 @@ def save_notion_settings(token: str, db_id: str, column: str = "") -> dict:
         except Exception:
             pass
     except Exception as exc:
-        return {"ok": False, "error": f"저장 실패({type(exc).__name__})"}
-    STATE["columns"] = cols or None
+        return f"저장 실패({type(exc).__name__})"
+    return None
+
+
+def save_notion_settings(token: str, db_id: str = "", column: str = "") -> dict:
+    """⚙ 설정 변경(접힘 메뉴): 토큰만 넣어도 되고 DB ID 는 비워 둬도 된다.
+
+    DB ID 가 비어 있으면 토큰으로 연결된 노션 DB 를 자동으로 찾아(POST /v1/search)
+    담당자 열이 있는 DB 를 골라 저장한다(1개면 그 DB, 여러 개면 가장 맞는 DB를 기본으로).
+    DB ID 는 페이지/DB 전체 URL·하이픈 없는 32자로 붙여넣어도 ID 만 뽑아 저장한다.
+    토큰은 화면·로그로 돌려주지 않는다.
+    """
+    token = (token or "").strip()
+    raw_db = (db_id or "").strip()
+    db_id = main.normalize_notion_db_id(raw_db)
+    if not token:
+        return {"ok": False, "error": "노션 API 토큰을 넣어 주세요. (DB ID 는 비워 두면 자동으로 찾습니다)"}
+    old = read_secret()
+    old_token = str(old.get("token") or "").strip()
+    old_db = main.normalize_notion_db_id(old.get("db_id"))
+    col = (column or "").strip() or str(old.get("column") or main.NOTION_DEFAULT_COLUMN).strip()
+    databases = [d for d in (old.get("_databases") or []) if isinstance(d, dict) and d.get("id")]
+    note = ""
+    found_now = []
+    if not db_id:
+        # 토큰만으로 연결된 DB 를 찾는다
+        add_line("[설정] DB ID 없이 진행 — 토큰으로 연결된 노션 DB 를 찾습니다…")
+        found_now = main.notion_discover_databases(token) or []
+        if found_now:
+            databases = found_now
+        usable = [d for d in databases if d.get("columns")]
+        pick = main.pick_notion_database(databases, prefer_id=old_db)
+        if pick:
+            db_id = pick["id"]
+            note = f"DB ID 없이 저장 — 토큰으로 연결된 DB에서 '{pick.get('title')}'를 골랐습니다."
+            if len(usable) > 1:
+                note += (f" 연결된 DB가 {len(usable)}개라 가장 맞는 DB를 기본으로 골랐습니다"
+                         " — 다른 DB로 바꾸려면 ⚙ 설정 변경의 [DB]에서 고르세요.")
+        elif old_db:
+            db_id = old_db
+            note = "노션에서 DB를 자동으로 찾지 못해 저장된 DB ID로 저장했습니다."
+        else:
+            # DB 를 못 찾아도 토큰은 저장해 둔다 — 노션에서 DB에 통합을 추가한 뒤 [↻ DB 목록]으로 이어갈 수 있게
+            data = dict(old)
+            data.update({"enabled": True, "token": token, "db_id": "", "column": col})
+            data.pop("_단계", None)
+            write_err = _write_secret(data)
+            if write_err:
+                return {"ok": False, "error": write_err}
+            STATE["columns"] = []
+            STATE["columns_error"] = ("노션에서 이 API 연결(Integration)을 DB 페이지에 추가했는지 확인해 주세요."
+                                      " 토큰은 저장해 두었으니, DB에 연결한 뒤 [↻ DB 목록]을 누르면 이어집니다.")
+            add_line(f"[경고] {STATE['columns_error']}")
+            return {"ok": False, "token_saved": True, "error": STATE["columns_error"],
+                    "columns": [], "columns_error": STATE["columns_error"]}
+
+    changed = not (token == old_token and db_id == old_db)
+    cols = main.notion_list_columns(db_id, token) or []
+    if cols:
+        if col not in cols:
+            col = cols[0]
+    elif changed:
+        note = (note + " " if note else "") + "저장은 했지만 노션에서 열 목록을 확인하지 못했습니다(토큰·DB 연결 권한 확인)."
+        # 직접 넣은 DB에서 못 읽었어도, 연결된 다른 DB가 있으면 알려 준다
+        other = [d for d in databases if d.get("columns") and d.get("id") != db_id]
+        if not other and not found_now:
+            other = [d for d in (main.notion_discover_databases(token) or [])
+                     if d.get("columns") and d.get("id") != db_id]
+        if other:
+            names = ", ".join(f"'{d.get('title')}'" for d in other[:3])
+            note += f" 이 토큰으로 열을 읽을 수 있는 DB가 있습니다: {names}."
+            databases = databases or other
+    data = dict(old)
+    data.update({"enabled": True, "token": token, "db_id": db_id, "column": col})
+    data.pop("_단계", None)
+    if databases:
+        data["_databases"] = [{"id": d.get("id"), "title": d.get("title"), "columns": list(d.get("columns") or [])}
+                              for d in databases]
+    if cols:
+        data["_columns"] = list(cols)
+    elif changed:
+        data.pop("_columns", None)   # 다른 DB·토큰인데 못 읽었으면 이전 DB 의 열 목록은 버린다
+    err = _write_secret(data)
+    if err:
+        return {"ok": False, "error": err}
+    # 저장 직후 화면이 바로 새 열 목록을 쓰도록 캐시를 맞춘다(토큰/DB 가 바뀌었는데 못 읽었으면 비운다).
+    if cols:
+        STATE["columns"] = list(cols)
+        STATE["columns_error"] = None
+    else:
+        STATE["columns"] = [] if changed else \
+            [str(c).strip() for c in (data.get("_columns") or []) if str(c).strip()]
+        STATE["columns_error"] = main.notion_last_error() or \
+            "노션에서 열 목록을 읽지 못했습니다(토큰·DB ID·DB 연결 권한 확인)."
     add_line(f"[설정] 노션 설정을 저장했습니다. (담당자 열: {col}) — 다음부터 이 설정을 그대로 씁니다.")
-    return {"ok": True, "column": col, "columns": cols, "note": note}
+    if cols:
+        add_line(f"[설정] 노션에서 담당자 열 {len(cols)}개를 읽었습니다: {', '.join(cols)}")
+    elif STATE["columns_error"]:
+        add_line(f"[경고] {STATE['columns_error']}")
+    if raw_db and raw_db != db_id:
+        add_line(f"[설정] 붙여넣은 주소에서 DB ID 만 추출했습니다: {db_id}")
+    return {"ok": True, "column": col, "columns": list(STATE["columns"] or []),
+            "columns_error": STATE["columns_error"],
+            "databases": _public_databases(data.get("_databases"), db_id),
+            "normalized_db": db_id if raw_db and raw_db != db_id else None,
+            "note": note}
+
+
+def switch_notion_db(db_id: str) -> dict:
+    """[DB] 선택 변경: 저장된 토큰으로 그 DB 의 담당자 열을 다시 읽어 설정을 바꾼다."""
+    data = read_secret()
+    token = str(data.get("token") or "").strip()
+    if not token:
+        return {"ok": False, "error": "저장된 노션 토큰이 없습니다. ⚙ 설정 변경에서 토큰을 먼저 저장해 주세요."}
+    new_id = main.normalize_notion_db_id(db_id)
+    if not new_id:
+        return {"ok": False, "error": "DB ID 를 확인해 주세요."}
+    cols = main.notion_list_columns(new_id, token) or []
+    err = None if cols else (main.notion_last_error() or "노션에서 열 목록을 읽지 못했습니다.")
+    col = str(data.get("column") or main.NOTION_DEFAULT_COLUMN).strip()
+    if cols and col not in cols:
+        col = cols[0]
+    data.update({"db_id": new_id, "column": col, "enabled": True})
+    data.pop("_단계", None)
+    if cols:
+        data["_columns"] = list(cols)
+    else:
+        data.pop("_columns", None)
+    write_err = _write_secret(data)
+    if write_err:
+        return {"ok": False, "error": write_err}
+    STATE["columns"] = list(cols)
+    STATE["columns_error"] = err
+    title = next((str(d.get("title")) for d in (data.get("_databases") or [])
+                  if main.normalize_notion_db_id((d or {}).get("id")) == new_id), "")
+    add_line(f"[설정] 노션 DB 를 바꿨습니다: {title or new_id[-6:]} · 담당자 열 {len(cols)}개")
+    return {"ok": True, "db_id": new_id, "column": col, "columns": list(cols),
+            "columns_error": err, "databases": _public_databases(data.get("_databases"), new_id)}
+
+
+def refresh_databases() -> dict:
+    """[↻ DB 목록]: 저장된 토큰으로 연결된 노션 DB 목록을 다시 읽는다(DB ID 가 비어 있으면 자동 선택)."""
+    data = read_secret()
+    token = str(data.get("token") or "").strip()
+    if not token:
+        return {"ok": False, "error": "저장된 노션 토큰이 없습니다. ⚙ 설정 변경에서 토큰을 먼저 저장해 주세요."}
+    found = main.notion_discover_databases(token)
+    if found is None:
+        err = main.notion_last_search_error() or "노션 DB 목록을 읽지 못했습니다(토큰 확인)."
+        return {"ok": False, "error": err, "databases": _public_databases(data.get("_databases"),
+                                                                          data.get("db_id"))}
+    if found:
+        data["_databases"] = [{"id": d["id"], "title": d.get("title"), "columns": list(d.get("columns") or [])}
+                              for d in found]
+    cur = main.normalize_notion_db_id(data.get("db_id"))
+    pick = main.pick_notion_database(found, prefer_id=cur) if found else None
+    note = ""
+    if pick and not cur:
+        # DB ID 가 비어 있던 설정 — 찾은 DB 중 기본 DB 로 바로 이어 준다
+        data.update({"db_id": pick["id"], "enabled": True})
+        cur = pick["id"]
+        cols = list(pick.get("columns") or [])
+        col = str(data.get("column") or main.NOTION_DEFAULT_COLUMN).strip()
+        data["column"] = col if col in cols else (cols[0] if cols else col)
+        if cols:
+            data["_columns"] = cols
+        note = f"DB ID 없이 '{pick.get('title')}' DB 를 골라 저장했습니다."
+    write_err = _write_secret(data)
+    if write_err:
+        return {"ok": False, "error": write_err}
+    databases = _public_databases(data.get("_databases"), cur)
+    if not found:
+        return {"ok": False, "databases": databases,
+                "error": "이 API 연결(Integration)이 추가된 DB 를 찾지 못했습니다. "
+                         "노션 DB 화면 ⋯ → 연결 에서 통합을 추가했는지 확인해 주세요."}
+    if cur:
+        cols = [str(c).strip() for c in (data.get("_columns") or []) if str(c).strip()]
+        if cols:
+            STATE["columns"] = cols
+            STATE["columns_error"] = None
+    add_line(f"[설정] 노션 DB 목록 새로고침 — {len(databases)}개" + (f" · {note}" if note else ""))
+    return {"ok": True, "databases": databases, "count": len(databases), "note": note,
+            "columns": list(STATE["columns"] or []), "column": data.get("column"),
+            "columns_error": STATE.get("columns_error")}
 
 
 def disable_notion() -> dict:
@@ -228,16 +403,42 @@ def disable_notion() -> dict:
 
 
 def notion_columns(force: bool = False) -> list:
-    """노션 DB 스키마에서 참가자 열 후보를 읽는다(한 번 읽어 캐시)."""
+    """노션 DB 스키마에서 참가자 열 후보를 읽는다(한 번 읽어 캐시).
+
+    실시간 읽기가 실패하면 notion_secret.json 에 저장해 둔 `_columns` 로 폴백한다.
+    이때는 STATE["columns_error"] 에 사유를 남겨 화면이 '열 목록을 못 읽었음'을 보여 준다.
+    """
     if STATE["columns"] and not force:
-        return STATE["columns"]
+        return list(STATE["columns"])
     cfg = main.load_notion_config()
     if not cfg:
+        STATE["columns"] = []
+        STATE["columns_error"] = None
         return []
     cols = main.notion_list_columns(cfg["db_id"], cfg["token"])
     if cols:
-        STATE["columns"] = cols
-    return cols or []
+        STATE["columns"] = list(cols)
+        STATE["columns_error"] = None
+        return list(cols)
+    reason = main.notion_last_error() or "노션에서 열 목록을 읽지 못했습니다(토큰·DB ID·DB 연결 권한 확인)."
+    cached = [str(c).strip() for c in (cfg.get("columns") or []) if str(c).strip()]
+    if cached:
+        STATE["columns"] = list(cached)
+        STATE["columns_error"] = f"{reason} 저장해 둔 열 {len(cached)}개로 표시 중입니다."
+        return list(cached)
+    STATE["columns"] = []
+    STATE["columns_error"] = reason
+    return []
+
+
+def reload_columns() -> dict:
+    """[↻ 새로고침]: 노션에서 담당자 열 목록을 지금 다시 읽어 온다(캐시 무시)."""
+    cols = notion_columns(force=True)
+    err = STATE.get("columns_error")
+    add_line(f"[설정] 담당자 열 새로고침 — {len(cols)}개" + (f" ({err})" if err else ""))
+    return {"ok": not err, "columns": list(cols),
+            "column": (main.load_notion_config() or {}).get("column"),
+            "error": err}
 
 
 def check_login() -> dict:
@@ -279,14 +480,28 @@ def api_status() -> dict:
     cfg = main.load_notion_config()
     state = main.notion_secret_state()
     notion_state = "saved" if cfg else (state if state in ("missing", "disabled", "incomplete") else "missing")
+    token_saved = bool(str(raw.get("token") or "").strip())
+    columns = notion_columns() if cfg else []
+    columns_error = STATE.get("columns_error") if cfg else None
+    if not cfg and token_saved and notion_state != "disabled":
+        # 토큰만 저장된 상태 — DB ID 를 못 정한 이유를 화면에서 바로 알 수 있게
+        columns_error = ("DB ID 가 아직 비어 있습니다 — ⚙ 설정 변경의 [↻ DB 목록]을 누르면 "
+                         "이 토큰에 연결된 DB 를 찾아 저장합니다.")
+    databases = _public_databases(raw.get("_databases"), raw.get("db_id"))
+    if not databases and cfg:
+        # 목록을 아직 못 읽었어도 지금 쓰는 DB 는 보여 준다([↻ DB 목록]을 누르면 전체를 읽어 온다)
+        databases = [{"id": cfg["db_id"], "title": f"저장된 DB (…{cfg['db_id'][-6:]})",
+                      "columns": len(columns), "current": True}]
     notion = {
         "enabled": bool(cfg),
         "state": notion_state,
         "column": (cfg or {}).get("column") or raw.get("column"),
-        "columns": notion_columns() if cfg else [],
-        "db_tail": (str(raw.get("db_id") or "")[-6:] or None),
+        "columns": columns,
+        "columns_error": columns_error,
+        "databases": databases,
+        "db_tail": (main.normalize_notion_db_id(raw.get("db_id"))[-6:] or None),
         "file": bool(secret_path().is_file()),
-        "token_saved": bool(str(raw.get("token") or "").strip()),
+        "token_saved": token_saved,
     }
     with STATE["lock"]:
         login = STATE["login"]
@@ -360,6 +575,10 @@ def preview(mode: str = "notion", limit=main.LIMIT_DEFAULT, column: str | None =
         remember_column(column)          # 이번에 고른 열을 다음 실행의 기본값으로 기억
         notion_cfg = main.load_notion_config(column=column)
         if not notion_cfg:
+            raw = read_secret()
+            if str(raw.get("token") or "").strip():
+                return {"ok": False, "error": "노션 DB 가 아직 정해지지 않았습니다 — ⚙ 설정 변경의 [↻ DB 목록]을 "
+                                              "누르면 이 토큰에 연결된 DB 를 찾아 저장합니다."}
             return {"ok": False, "error": "노션 연동 설정(notion_secret.json)이 없습니다. "
                                           "PC에서 python main.py --setup-notion 으로 먼저 설정해 주세요."}
     items = main.collect_campaigns(max_pages)
@@ -619,6 +838,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(save_notion_settings(payload.get("token") or "",
                                             payload.get("db_id") or "",
                                             payload.get("column") or ""))
+        elif path == "/api/notion-columns":
+            self._json(reload_columns())
+        elif path == "/api/notion-db":
+            self._json(switch_notion_db(payload.get("db_id") or ""))
+        elif path == "/api/notion-dbs":
+            self._json(refresh_databases())
         elif path == "/api/notion-disable":
             self._json(disable_notion())
         else:
@@ -765,7 +990,10 @@ PAGE_HTML = r"""<!DOCTYPE html>
     <div class="row">
       <span id="notionPill" class="pill"><i class="dot"></i>확인 중…</span>
       <label class="field">이번에 기록할 담당자 열
-        <select id="column"><option value="">(불러오는 중)</option></select>
+        <span style="display:flex;gap:6px;align-items:center">
+          <select id="column"><option value="">(불러오는 중)</option></select>
+          <button class="btn" id="btnReloadCols" type="button" title="노션에서 열 목록을 다시 읽어 옵니다">↻ 새로고침</button>
+        </span>
       </label>
     </div>
     <p class="hint" id="columnHint">노션 토큰·DB ID 는 <b>한 번 저장하면 다시 묻지 않습니다.</b> 이번 실행에서 <b>어느 담당자 열에 기록할지</b>만 고르면 됩니다. 고른 열은 다음 실행의 기본값으로 기억됩니다.</p>
@@ -776,13 +1004,19 @@ PAGE_HTML = r"""<!DOCTYPE html>
         <label class="field">노션 API 토큰 <span class="muted">(바꿀 때만)</span>
           <input type="password" id="tokenNew" autocomplete="off" spellcheck="false" placeholder="ntn_…">
         </label>
-        <label class="field">DB ID <span class="muted">(바꿀 때만)</span>
-          <input type="text" id="dbNew" autocomplete="off" spellcheck="false" placeholder="32자리">
+        <label class="field">DB ID <span class="muted">(안 넣어도 됨 · 토큰으로 자동 찾기)</span>
+          <input type="text" id="dbNew" autocomplete="off" spellcheck="false" placeholder="비워 두면 자동 · 노션 주소도 됨">
         </label>
         <button class="btn" id="btnSaveNotion">저장</button>
         <button class="btn danger" id="btnNotionOff">노션 기록 끄기</button>
       </div>
-      <p class="hint">저장하면 담당자 열 목록을 노션에서 다시 읽어 옵니다. 토큰은 이 PC 의 <code>notion_secret.json</code> 에만 저장되고 화면·로그로는 나오지 않습니다. 열만 바꾸려면 위 [담당자 열]에서 고르면 됩니다.</p>
+      <div class="row">
+        <label class="field">연결된 DB <span class="muted">(여러 개면 여기서 바꿈)</span>
+          <select id="dbSelect"><option value="">(아직 없음)</option></select>
+        </label>
+        <button class="btn" id="btnReloadDbs" type="button">↻ DB 목록</button>
+      </div>
+      <p class="hint">토큰만 넣고 저장해도 됩니다 — DB ID 칸을 비우면 이 토큰(API 연결)에 연결된 노션 DB 를 찾아 담당자 열이 있는 DB 를 자동으로 고릅니다. 여러 개면 [연결된 DB]에서 바꿀 수 있습니다. 주소를 붙여넣어도 ID 만 자동 추출합니다. 토큰은 이 PC 의 <code>notion_secret.json</code> 에만 저장되고 화면·로그로는 나오지 않습니다.</p>
       <div class="banner" id="adminBanner"></div>
     </details>
     <p class="hint" id="columnModeHint">1번 모드는 이 열이 비어 있는 노션 행만 신청합니다(노션에 없는 신규 상품은 제외).</p>
@@ -897,9 +1131,10 @@ function setPill(el, cls, text){
 }
 
 function banner(el, text, kind){
-  if(!text){ el.className = "banner"; el.textContent = ""; return; }
+  if(!text){ el.className = "banner"; el.textContent = ""; el.dataset.kind = ""; return; }
   el.className = "banner show " + (kind || "info");
   el.textContent = text;
+  el.dataset.kind = kind || "info";
 }
 
 /* ── 상태 ───────────────────────────────────────────── */
@@ -932,11 +1167,29 @@ async function refreshStatus(){
       sel.innerHTML = names.map(x => `<option value="${esc(x)}">${esc(x)}</option>`).join("");
     }
     if(want) sel.value = want;
+    sel.title = `담당자 열 ${cols.length}개`;
   } else if(want && sel.dataset.sig !== want){
     sel.dataset.sig = want;
     sel.innerHTML = `<option value="${esc(want)}">${esc(want)}</option>`;
     sel.value = want;
+    sel.title = "노션에서 열 목록을 읽지 못해 저장된 열 1개만 표시 중";
   }
+  /* 열 목록을 못 읽었으면 이유를 숨기지 않고 그대로 보여 준다(1개만 뜨는 원인) */
+  const colErr = n.columns_error || "";
+  if(colErr) banner($("columnBanner"), colErr + " — [↻ 새로고침]으로 다시 읽어 보세요.", "err");
+  else if($("columnBanner").dataset.kind === "err") banner($("columnBanner"), "");
+
+  /* 연결된 DB 목록(여러 개면 여기서 바꿈) */
+  const dbs = n.databases || [];
+  const dsel = $("dbSelect");
+  const dsig = dbs.map(d => `${d.id}:${d.title}:${d.columns}:${d.current ? 1 : 0}`).join("|");
+  if(dsel.dataset.sig !== dsig){
+    dsel.dataset.sig = dsig;
+    dsel.innerHTML = dbs.length
+      ? dbs.map(d => `<option value="${esc(d.id)}"${d.current ? " selected" : ""}>${esc(d.title)} · 담당자 열 ${d.columns}개</option>`).join("")
+      : `<option value="">(아직 없음 — [↻ DB 목록])</option>`;
+  }
+  if(dbs.length){ const cur = dbs.find(d => d.current); if(cur) dsel.value = cur.id; }
 }
 
 /* ── 미리보기 ────────────────────────────────────────── */
@@ -1062,17 +1315,42 @@ $("btnCheckLogin").onclick = async () => {
 $("btnSaveNotion").onclick = async () => {
   const token = $("tokenNew").value.trim();
   const db = $("dbNew").value.trim();
-  if(!token || !db){ banner($("adminBanner"), "노션 API 토큰과 DB ID 를 모두 넣어 주세요.", "err"); return; }
+  if(!token){ banner($("adminBanner"), "노션 API 토큰을 넣어 주세요. (DB ID 는 비워 두면 자동으로 찾습니다)", "err"); return; }
   $("btnSaveNotion").disabled = true;
   try{
     const r = await api("/api/notion-setup", {token, db_id: db, column: $("column").value || ""});
-    if(!r.ok){ banner($("adminBanner"), r.error, "err"); return; }
+    const extra = r.normalized_db ? ` 주소에서 DB ID 만 추출했습니다(${r.normalized_db}).` : "";
+    if(!r.ok){ banner($("adminBanner"), (r.error || "저장하지 못했습니다.") + extra, "err"); await refreshStatus(); return; }
     $("tokenNew").value = "";
     $("dbNew").value = "";
-    banner($("adminBanner"), r.note || `저장했습니다. 담당자 열 '${r.column}' · 이제 토큰·DB ID 는 다시 묻지 않습니다.`, "info");
+    if(r.columns_error) banner($("adminBanner"), r.columns_error + extra, "err");
+    else banner($("adminBanner"), (r.note || `저장했습니다. 담당자 열 '${r.column}' · 이제 토큰·DB ID 는 다시 묻지 않습니다.`) + extra, "info");
     await refreshStatus();
   } finally {
     $("btnSaveNotion").disabled = false;
+  }
+};
+$("dbSelect").addEventListener("change", async () => {
+  const v = $("dbSelect").value;
+  if(!v) return;
+  const r = await api("/api/notion-db", {db_id: v});
+  if(r.ok && !r.columns_error)
+    banner($("adminBanner"), `DB 를 바꿨습니다 · 담당자 열 ${(r.columns || []).length}개`, "info");
+  else banner($("adminBanner"), r.error || r.columns_error || "DB 를 바꾸지 못했습니다.", "err");
+  await refreshStatus();
+});
+$("btnReloadDbs").onclick = async () => {
+  const btn = $("btnReloadDbs");
+  btn.disabled = true;
+  btn.textContent = "찾는 중…";
+  try{
+    const r = await api("/api/notion-dbs", {});
+    if(r.ok) banner($("adminBanner"), `${r.count}개 DB 를 찾았습니다.` + (r.note ? ` ${r.note}` : ""), "info");
+    else banner($("adminBanner"), r.error || "DB 를 찾지 못했습니다.", "err");
+    await refreshStatus();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "↻ DB 목록";
   }
 };
 $("btnNotionOff").onclick = async () => {
@@ -1085,8 +1363,23 @@ $("column").addEventListener("change", async () => {
   const v = $("column").value;
   if(!v) return;
   const r = await api("/api/column", {column: v});
-  if(r.ok) banner($("columnBanner"), `'${r.column}' 열로 기억했습니다. 다음 실행에도 이 열이 기본입니다.`, "info");
+  if(r.ok && $("columnBanner").dataset.kind !== "err")
+    banner($("columnBanner"), `'${r.column}' 열로 기억했습니다. 다음 실행에도 이 열이 기본입니다.`, "info");
 });
+$("btnReloadCols").onclick = async () => {
+  const btn = $("btnReloadCols");
+  btn.disabled = true;
+  btn.textContent = "불러오는 중…";
+  try{
+    const r = await api("/api/notion-columns", {});
+    if(r.ok) banner($("columnBanner"), `담당자 열 ${(r.columns || []).length}개를 노션에서 다시 읽었습니다.`, "info");
+    else banner($("columnBanner"), (r.error || "열 목록을 읽지 못했습니다.") + " — 토큰·DB ID·DB 연결(⋯ → 연결)을 확인해 주세요.", "err");
+    await refreshStatus();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "↻ 새로고침";
+  }
+};
 $("column").addEventListener("change", () => { $("previewSummary").style.display = "none"; });
 $("notionAllWrap").style.display = "flex";
 syncLimitChips();
