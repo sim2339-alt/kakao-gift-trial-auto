@@ -8,6 +8,7 @@
 - 1부: 필터/정렬 로직을 저장된 샘플 응답으로 검증
 - 2부: Playwright 페이지를 가짜 객체로 바꿔 신청 플로우(성공/이미신청/버튼없음/로그인필요) 검증
 - 6부: 웹 조종판(web_ui.py) API·실행/중단·토큰 미노출 검증
+- 7부: 노션 API 설정 1회 저장 → 이후 실행은 담당자 열만 선택(토큰·DB ID 재질문 없음) 검증
 """
 
 from __future__ import annotations
@@ -80,7 +81,7 @@ def build_item(title, cats):
 
 
 def test_filter():
-    print("[1/6] 필터 검증")
+    print("[1/7] 필터 검증")
     flt = main.load_filter()
     cases = {
         "수플린 설향딸기 800g": "allow",
@@ -343,7 +344,7 @@ class FakePage:
 
 
 def test_apply_flow():
-    print("[2/6] 신청 플로우 검증 (가짜 브라우저)")
+    print("[2/7] 신청 플로우 검증 (가짜 브라우저)")
     campaign = {
         "campaignId": "abc",
         "campaignTitle": "테스트 상품",
@@ -598,7 +599,7 @@ class use_input:
 
 
 def test_notion():
-    print("[4/6] 노션 기록·설정·실행 모드 검증 (가짜 노션 API)")
+    print("[4/7] 노션 기록·설정·실행 모드 검증 (가짜 노션 API)")
     NOW = datetime(2026, 11, 20, 11, 0, 0)
     CFG = {"token": "ntn_dummy", "db_id": "db-dummy", "column": "메인.엽", "file": "notion_secret.json"}
     item = {
@@ -850,7 +851,8 @@ class FakeStdin:
 
 
 def test_main_modes():
-    print("[5/6] 실행 모드 통합 검증 (main() — 네트워크·브라우저 없이)")
+    print("[5/7] 실행 모드 통합 검증 (main() — 네트워크·브라우저 없이)")
+    main.notion_list_columns = lambda db, tok, transport=None: ["메인.엽", "서브.동"]
     items = [
         build_item("스누피 3단 전기요", [(97, "디지털·가전", 163, "계절가전")]),
         build_item("수플린 설향딸기 800g", [(93, "식품", 203, "과일·견과")]),
@@ -862,6 +864,7 @@ def test_main_modes():
         "collect_applied_ids": main.collect_applied_ids,
         "load_notion_config": main.load_notion_config,
         "notion_rows": main.notion_rows,
+        "notion_list_columns": main.notion_list_columns,
         "run_apply": main.run_apply,
         "stdin": sys.stdin,
     }
@@ -958,6 +961,7 @@ def test_main_modes():
         main.collect_applied_ids = saved["collect_applied_ids"]
         main.load_notion_config = saved["load_notion_config"]
         main.notion_rows = saved["notion_rows"]
+        main.notion_list_columns = saved["notion_list_columns"]
         main.run_apply = saved["run_apply"]
         sys.stdin = saved["stdin"]
 
@@ -969,7 +973,7 @@ def cleanup():
 
 # --------------------------------------------- 6부: 웹 조종판(web_ui) 검증
 def test_web():
-    print("[6/6] 웹 조종판 API 검증 (가짜 카카오·노션, 실제 HTTP 서버)")
+    print("[6/7] 웹 조종판 API 검증 (가짜 카카오·노션, 실제 HTTP 서버)")
     import web_ui
 
     web_ui.reset_state()
@@ -1160,7 +1164,7 @@ def test_web():
 
 
 def test_login_logic():
-    print("[3/6] 로그인 로직 검증 (네트워크 없이)")
+    print("[3/7] 로그인 로직 검증 (네트워크 없이)")
     url = main._login_url()
     check("로그인 주소가 웹 로그인 입구(shopping-userauth-web)인가",
           url.startswith("https://shopping-userauth-web.kakao.com/login?channel=GIFT&redirect_url="), url[:80])
@@ -1229,6 +1233,188 @@ def test_login_logic():
     check("로그인 폴링: 시간 초과 시 실패 반환", ok is False, f"ok={ok}")
 
 
+# --------------------- 7부: 노션 1회 저장 · 담당자 열만 선택(다시 묻지 않음)
+def test_notion_once():
+    print("[7/7] 노션 1회 저장 · 담당자 열만 선택 검증 (가짜 노션 API)")
+    tmp = ROOT / "logs" / "_once_notion_secret.json"
+    tmp.parent.mkdir(exist_ok=True)
+    tmp.write_text(json.dumps({"enabled": True, "token": "ntn_saved_once", "db_id": "db-once",
+                               "column": "메인.엽", "note": "keep"}, ensure_ascii=False), encoding="utf-8")
+    cols = ["메인.엽", "1팀.엽2(2200)", "서브.동"]
+    saved = {k: getattr(main, k) for k in ("notion_list_columns", "collect_campaigns",
+                                           "collect_applied_ids", "load_notion_config",
+                                           "notion_rows", "notion_secret_state",
+                                           "run_apply", "NOTION_SECRET_FILE")}
+    saved["stdin"] = sys.stdin
+    main.notion_list_columns = lambda db, tok, transport=None: list(cols)
+    main.NOTION_SECRET_FILE = str(tmp)
+    try:
+        # 1) 저장된 설정은 묻지 않고 그대로 읽는다(토큰·DB ID 재질문 없음)
+        with use_input([]) as fake:
+            cfg = main.load_notion_config()
+        check("1회 저장: 토큰·DB ID 를 다시 묻지 않고 읽음", bool(cfg) and cfg["token"] == "ntn_saved_once"
+              and fake.prompts == [], str(fake.prompts))
+        check("1회 저장: 저장된 열을 기본으로 읽음", cfg["column"] == "메인.엽", str(cfg.get("column")))
+        check("1회 저장: 상태 = ok", main.notion_secret_state() == "ok", main.notion_secret_state())
+
+        # 2) 담당자 열만 묻는다 — Enter = 저장된 열
+        with use_input([""]) as fake:
+            col = main.ask_notion_column(cfg)
+        prompts = " ".join(fake.prompts)
+        check("열 선택: Enter → 저장된 열 유지", col == "메인.엽", col)
+        check("열 선택: 묻는 것은 열 하나뿐(토큰·DB ID 질문 없음)",
+              "토큰" not in prompts and "DB ID" not in prompts, prompts)
+        check("열 선택: Enter 만 누르면 파일 그대로",
+              json.loads(tmp.read_text(encoding="utf-8"))["column"] == "메인.엽")
+
+        # 3) 번호로 다른 열을 고르면 즉시 기억(다음 실행 기본값)
+        with use_input(["2"]):
+            col2 = main.ask_notion_column(cfg)
+        after = json.loads(tmp.read_text(encoding="utf-8"))
+        check("열 선택: 2번 → '1팀.엽2(2200)'", col2 == cols[1], col2)
+        check("열 선택: 고른 열을 파일에 기억", after["column"] == col2, str(after.get("column")))
+        check("열 선택: 기억할 때 토큰·DB ID·다른 값 보존",
+              after["token"] == "ntn_saved_once" and after["db_id"] == "db-once"
+              and after.get("note") == "keep", str(after))
+        check("열 선택: 다음 실행 기본값 = 직전 선택",
+              main.load_notion_config()["column"] == col2, main.load_notion_config()["column"])
+
+        # 4) 열 이름을 직접 쳐도 인정, 이상한 값은 저장된 열 유지
+        with use_input(["서브.동"]):
+            check("열 선택: 열 이름 직접 입력 인정",
+                  main.ask_notion_column(main.load_notion_config()) == "서브.동")
+        with use_input(["99"]):
+            check("열 선택: 목록에 없는 번호 → 저장된 열 유지",
+                  main.ask_notion_column(main.load_notion_config()) == "서브.동")
+
+        # 5) 노션 읽기가 실패해도 저장된 열로 진행(질문 없음)
+        main.notion_list_columns = lambda db, tok, transport=None: None
+        cfg5 = main.load_notion_config()
+        with use_input([]) as fake:
+            col5 = main.ask_notion_column(cfg5)
+        check("열 선택: 노션 읽기 실패 → 저장된 열·질문 없음", col5 == cfg5["column"] and fake.prompts == [],
+              f"{col5} {fake.prompts}")
+
+        # 6) 저장해 둔 열 목록(_columns)이 있으면 노션 읽기가 안 돼도 고를 수 있다
+        data = json.loads(tmp.read_text(encoding="utf-8"))
+        data["_columns"] = list(cols)
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        with use_input(["1"]) as fake:
+            col6 = main.ask_notion_column(main.load_notion_config())
+        check("열 선택: 저장해 둔 열 목록으로도 고를 수 있다",
+              bool(fake.prompts) and col6 in cols, f"{col6} {fake.prompts}")
+
+        # 7) 설정 변경(--setup-notion): Enter 만 누르면 기존 값 유지 + 다른 키 보존
+        main.notion_list_columns = lambda db, tok, transport=None: list(cols)
+        with use_input(["", "", ""]) as fake:
+            cfg7 = main.setup_notion()
+        saved7 = json.loads(tmp.read_text(encoding="utf-8"))
+        check("설정 변경: Enter 만 → 토큰·DB ID 유지",
+              saved7["token"] == "ntn_saved_once" and saved7["db_id"] == "db-once", str(saved7.get("db_id")))
+        check("설정 변경: 열도 유지", saved7["column"] in cols, str(saved7.get("column")))
+        check("설정 변경: 다른 키·열 목록 보존", saved7.get("note") == "keep" and saved7.get("_columns") == cols,
+              str(saved7.keys()))
+        check("설정 변경: 저장 후 바로 쓸 수 있는 설정 반환", bool(cfg7) and cfg7["column"] == saved7["column"])
+
+        # 8) main(): 배치(--limit)는 토큰·DB ID·열을 묻지 않는다
+        tmp.write_text(json.dumps({"enabled": True, "token": "ntn_saved_once", "db_id": "db-once",
+                                   "column": "메인.엽", "note": "keep"}, ensure_ascii=False), encoding="utf-8")
+        items = [build_item("수플린 설향딸기 800g", [(93, "식품", 203, "과일·견과")]),
+                 build_item("스누피 3단 전기요", [(97, "디지털·가전", 163, "계절가전")])]
+        main.collect_campaigns = lambda mp: items
+        main.collect_applied_ids = lambda: None
+        main.notion_rows = lambda cfg, transport=None: [
+            {"page_id": "p1", "campaignId": "id-수플린 설향", "title": "t", "mark": ""},
+        ]
+        seen = {}
+
+        def fake_run_apply(cands, args):
+            ncfg = getattr(args, "notion_cfg", None)
+            seen.update({"count": len(cands),
+                         "column": (ncfg or {}).get("column"),
+                         "token": (ncfg or {}).get("token"),
+                         "notion": ncfg is not None})
+            return 0
+
+        main.run_apply = fake_run_apply
+        sys.stdin = FakeStdin(True)
+        with use_input([]) as fake:
+            rc = main.main(["--limit", "1"])
+        check("실행(배치): 아무것도 묻지 않음", rc == 0 and fake.prompts == [], str(fake.prompts))
+        check("실행(배치): 저장된 열·토큰 그대로 사용",
+              seen.get("column") == "메인.엽" and seen.get("token") == "ntn_saved_once", str(seen))
+
+        # 9) 대화형 마법사는 '어느 담당자 열'만 묻는다
+        with use_input(["2", "3", "2"]) as fake:
+            rc = main.main([])
+        joined = " ".join(fake.prompts)
+        check("실행(대화형): 토큰·DB ID 질문 없음", "노션 API 토큰" not in joined and "DB ID" not in joined,
+              joined)
+        check("실행(대화형): 담당자 열을 묻는다", "담당자 열" in joined, joined)
+        check("실행(대화형): 고른 2번 열로 실행", rc == 0 and seen.get("column") == cols[1], str(seen))
+        check("실행(대화형): 고른 열을 파일에 기억",
+              json.loads(tmp.read_text(encoding="utf-8"))["column"] == cols[1])
+        with use_input(["2", "1", ""]) as fake:
+            rc = main.main([])
+        check("실행(대화형): Enter → 직전 선택 열 유지", rc == 0 and seen.get("column") == cols[1], str(seen))
+
+        # 10) --ask-column: 개수를 줘도 열만 묻는다(run_auto.bat 경로)
+        with use_input(["3"]) as fake:
+            rc = main.main(["--limit", "1", "--ask-column"])
+        check("--ask-column: 열 하나만 묻고 3번 열로 실행",
+              rc == 0 and seen.get("column") == cols[2] and len(fake.prompts) == 1, f"{fake.prompts} {seen}")
+
+        # 11) 노션을 끄면 켜라고 다시 묻지 않고 한 줄만 알린다
+        data = json.loads(tmp.read_text(encoding="utf-8"))
+        data["enabled"] = False
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        check("상태: enabled=false → disabled", main.notion_secret_state() == "disabled")
+        with use_input([]) as fake:
+            rc = main.main(["--limit", "1"])
+        check("실행: 노션 꺼짐 → 묻지 않고 진행", rc == 0 and fake.prompts == [] and seen.get("notion") is False,
+              f"{fake.prompts} {seen}")
+
+        # 12) 웹 조종판: 상태 saved · ⚙ 설정 변경(접힘)에만 토큰 입력
+        import web_ui
+        data["enabled"] = True
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        web_ui.reset_state()
+        st = web_ui.api_status()
+        check("웹: 상태 = 저장됨", st["notion"]["state"] == "saved" and st["notion"]["token_saved"] is True,
+              str(st["notion"]))
+        check("웹: 상태에 토큰 본문 없음", "ntn_saved_once" not in json.dumps(st, ensure_ascii=False))
+        check("웹 ⚙설정: 빈 토큰·DB ID 거부", web_ui.save_notion_settings("", "")["ok"] is False)
+        r = web_ui.save_notion_settings("ntn_new_token", "db-new", "")
+        after2 = json.loads(tmp.read_text(encoding="utf-8"))
+        check("웹 ⚙설정: 토큰·DB ID 저장(1회)", r["ok"] and after2["token"] == "ntn_new_token"
+              and after2["db_id"] == "db-new", str(r)[:120])
+        check("웹 ⚙설정: 응답에 토큰 없음", "ntn_new_token" not in json.dumps(r, ensure_ascii=False))
+        check("웹 ⚙설정: 담당자 열 자동 선택·다른 키 보존",
+              r["column"] in cols and after2.get("note") == "keep", str(r.get("column")))
+        web_ui.reset_state()
+        check("웹: 저장 직후 상태 saved", web_ui.api_status()["notion"]["state"] == "saved")
+        check("웹: 열만 바꿔도 기억", web_ui.save_column(cols[2])["ok"]
+              and json.loads(tmp.read_text(encoding="utf-8"))["column"] == cols[2])
+        check("웹 ⚙설정: 노션 기록 끄기", web_ui.disable_notion()["ok"]
+              and main.notion_secret_state() == "disabled")
+        check("웹: 꺼짐 상태 표시", web_ui.api_status()["notion"]["state"] == "disabled")
+
+        # 13) 화면: 토큰 입력은 '설정 변경' 접힘 메뉴 안에만 있다
+        html = web_ui.PAGE_HTML
+        check("웹 화면: ⚙ 설정 변경(접힘 details)", '<details class="admin" id="notionAdmin">' in html, "")
+        check("웹 화면: 토큰 입력은 접힘 메뉴 안", 'id="tokenNew"' in html
+              and html.index('id="tokenNew"') > html.index('id="notionAdmin"'), "")
+        check("웹 화면: 노션 카드에 토큰 상시 입력 없음", 'id="btnSaveColumn"' not in html, "")
+        check("웹 화면: '다시 묻지 않습니다' 안내", "다시 묻지 않습니다" in html, "")
+    finally:
+        for key, value in saved.items():
+            if key == "stdin":
+                sys.stdin = value
+            else:
+                setattr(main, key, value)
+        tmp.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     test_filter()
     test_apply_flow()
@@ -1236,6 +1422,7 @@ if __name__ == "__main__":
     test_notion()
     test_main_modes()
     test_web()
+    test_notion_once()
     cleanup()
     print()
     if FAILS:

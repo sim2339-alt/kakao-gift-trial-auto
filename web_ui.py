@@ -31,7 +31,7 @@ from pathlib import Path
 
 import main
 
-APP_VERSION = "2.2"
+APP_VERSION = "2.3"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 LOG_MAX = 4000          # 로그 창에 보관할 최대 줄 수
@@ -142,7 +142,10 @@ def read_secret() -> dict:
 
 
 def save_column(column: str) -> dict:
-    """참가자 열 이름만 notion_secret.json 에 저장한다(토큰·DB ID 는 그대로 둔다)."""
+    """담당자 열 이름만 notion_secret.json 에 저장한다(토큰·DB ID 는 그대로 둔다).
+
+    실행할 때 고른 열을 기억해 두는 데도 쓴다(다음에 열면 그 열이 기본값).
+    """
     column = (column or "").strip()
     if not column:
         return {"ok": False, "error": "열 이름이 비어 있습니다."}
@@ -152,6 +155,8 @@ def save_column(column: str) -> dict:
     data = read_secret()
     if not data:
         return {"ok": False, "error": "notion_secret.json 을 읽지 못했습니다(형식 확인)."}
+    if str(data.get("column") or "").strip() == column:
+        return {"ok": True, "column": column, "unchanged": True}
     data["column"] = column
     try:
         p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -159,6 +164,67 @@ def save_column(column: str) -> dict:
         return {"ok": False, "error": f"저장 실패({type(exc).__name__})"}
     add_line(f"[설정] 참가자 열을 '{column}' 로 저장했습니다.")
     return {"ok": True, "column": column}
+
+
+def remember_column(column: str | None) -> None:
+    """실행·미리보기에 쓴 열을 파일에 기억해 둔다(다음 실행의 기본값 = 직전에 고른 열)."""
+    column = (column or "").strip()
+    if column:
+        save_column(column)
+
+
+def save_notion_settings(token: str, db_id: str, column: str = "") -> dict:
+    """⚙ 설정 변경(접힘 메뉴): 토큰·DB ID·담당자 열을 저장한다. 토큰은 화면으로 돌려주지 않는다.
+
+    한 번 저장해 두면 실행할 때는 토큰·DB ID 를 다시 묻지 않고 담당자 열만 고른다.
+    """
+    token = (token or "").strip()
+    db_id = (db_id or "").strip()
+    if not token or not db_id:
+        return {"ok": False, "error": "노션 API 토큰과 DB ID 를 모두 넣어 주세요."}
+    old = read_secret()
+    old_token = str(old.get("token") or "").strip()
+    old_db = str(old.get("db_id") or "").strip()
+    col = (column or "").strip() or str(old.get("column") or main.NOTION_DEFAULT_COLUMN).strip()
+    cols = main.notion_list_columns(db_id, token) or []
+    note = ""
+    if cols:
+        if col not in cols:
+            col = cols[0]
+    elif not (token == old_token and db_id == old_db):
+        note = "저장은 했지만 노션에서 열 목록을 확인하지 못했습니다(토큰·DB ID·DB 연결 권한을 확인해 주세요)."
+    data = dict(old)
+    data.update({"enabled": True, "token": token, "db_id": db_id, "column": col})
+    data.pop("_단계", None)
+    if cols:
+        data["_columns"] = list(cols)
+    p = secret_path()
+    try:
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        try:
+            os.chmod(p, 0o600)
+        except Exception:
+            pass
+    except Exception as exc:
+        return {"ok": False, "error": f"저장 실패({type(exc).__name__})"}
+    STATE["columns"] = cols or None
+    add_line(f"[설정] 노션 설정을 저장했습니다. (담당자 열: {col}) — 다음부터 이 설정을 그대로 씁니다.")
+    return {"ok": True, "column": col, "columns": cols, "note": note}
+
+
+def disable_notion() -> dict:
+    """노션 기록을 끈다(파일은 지우지 않고 enabled=false — 토큰·DB ID 는 남겨 둔다)."""
+    data = read_secret()
+    if not data:
+        return {"ok": False, "error": "저장된 노션 설정이 없습니다."}
+    data["enabled"] = False
+    p = secret_path()
+    try:
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except Exception as exc:
+        return {"ok": False, "error": f"저장 실패({type(exc).__name__})"}
+    add_line("[설정] 노션 기록을 껐습니다(CSV 저장은 그대로). 다시 켜려면 ⚙ 설정 변경에서 저장하세요.")
+    return {"ok": True}
 
 
 def notion_columns(force: bool = False) -> list:
@@ -185,12 +251,16 @@ def check_login() -> dict:
 def api_status() -> dict:
     raw = read_secret()
     cfg = main.load_notion_config()
+    state = main.notion_secret_state()
+    notion_state = "saved" if cfg else (state if state in ("missing", "disabled", "incomplete") else "missing")
     notion = {
         "enabled": bool(cfg),
+        "state": notion_state,
         "column": (cfg or {}).get("column") or raw.get("column"),
         "columns": notion_columns() if cfg else [],
         "db_tail": (str(raw.get("db_id") or "")[-6:] or None),
         "file": bool(secret_path().is_file()),
+        "token_saved": bool(str(raw.get("token") or "").strip()),
     }
     with STATE["lock"]:
         login = STATE["login"]
@@ -261,6 +331,7 @@ def preview(mode: str = "notion", limit=main.LIMIT_DEFAULT, column: str | None =
     limit = normalize_limit(limit, main.LIMIT_DEFAULT)
     notion_cfg = None
     if mode == "notion":
+        remember_column(column)          # 이번에 고른 열을 다음 실행의 기본값으로 기억
         notion_cfg = main.load_notion_config(column=column)
         if not notion_cfg:
             return {"ok": False, "error": "노션 연동 설정(notion_secret.json)이 없습니다. "
@@ -296,6 +367,7 @@ def preview(mode: str = "notion", limit=main.LIMIT_DEFAULT, column: str | None =
 # ---------------------------------------------------------------------------
 def build_argv(payload: dict) -> list:
     mode = "notion" if (payload.get("mode") or "notion") == "notion" else "list"
+    remember_column(payload.get("column"))   # 고른 열을 기억(다음 실행 기본값)
     argv = []
     if mode == "notion":
         argv.append("--notion-pending")
@@ -512,6 +584,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, **check_login()})
         elif path == "/api/column":
             self._json(save_column(payload.get("column") or ""))
+        elif path == "/api/notion-setup":
+            self._json(save_notion_settings(payload.get("token") or "",
+                                            payload.get("db_id") or "",
+                                            payload.get("column") or ""))
+        elif path == "/api/notion-disable":
+            self._json(disable_notion())
         else:
             self._json({"ok": False, "error": "없는 주소입니다."}, 404)
 
@@ -587,10 +665,17 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .row{display:flex;flex-wrap:wrap;gap:12px;align-items:center}
   .row + .row{margin-top:12px}
   label.field{display:flex;flex-direction:column;gap:5px;font-size:12.5px;color:var(--muted)}
-  input[type=number],input[type=text],select{font:inherit;font-size:14px;color:var(--text);background:var(--bg);
+  input[type=number],input[type=text],input[type=password],select{font:inherit;font-size:14px;color:var(--text);background:var(--bg);
         border:1px solid var(--line);border-radius:10px;padding:9px 11px;min-width:96px}
   input[type=number]{width:110px}
+  input[type=password]{min-width:240px}
   select{min-width:150px}
+  details.admin{margin-top:12px;border-top:1px dashed var(--line);padding-top:10px}
+  details.admin summary{cursor:pointer;font-size:12.5px;color:var(--muted);list-style:none}
+  details.admin summary::-webkit-details-marker{display:none}
+  details.admin summary::before{content:"▸ ";display:inline-block;transition:.15s}
+  details.admin[open] summary::before{transform:rotate(90deg)}
+  details.admin[open] summary{color:var(--text);margin-bottom:10px}
   .seg{display:inline-flex;background:var(--bg);border:1px solid var(--line);border-radius:11px;padding:3px;gap:3px}
   .seg button{border:0;background:transparent;color:var(--muted);font:inherit;font-size:13.5px;
         padding:8px 14px;border-radius:8px;cursor:pointer}
@@ -643,16 +728,31 @@ PAGE_HTML = r"""<!DOCTYPE html>
   </header>
 
   <section class="card">
-    <h2>노션 연동</h2>
+    <h2>노션 연동 <span class="muted" id="notionSavedNote" style="font-weight:400;text-transform:none;letter-spacing:0"></span></h2>
     <div class="row">
       <span id="notionPill" class="pill"><i class="dot"></i>확인 중…</span>
-      <label class="field">참가자 열
+      <label class="field">이번에 기록할 담당자 열
         <select id="column"><option value="">(불러오는 중)</option></select>
       </label>
-      <button class="btn" id="btnSaveColumn">열 저장</button>
     </div>
-    <p class="hint" id="columnHint">1번 모드는 이 열이 비어 있는 노션 행만 신청합니다(노션에 없는 신규 상품은 제외).</p>
+    <p class="hint" id="columnHint">노션 토큰·DB ID 는 <b>한 번 저장하면 다시 묻지 않습니다.</b> 이번 실행에서 <b>어느 담당자 열에 기록할지</b>만 고르면 됩니다. 고른 열은 다음 실행의 기본값으로 기억됩니다.</p>
     <div class="banner" id="columnBanner"></div>
+    <details class="admin" id="notionAdmin">
+      <summary>⚙ 설정 변경 (토큰·DB ID — 처음 한 번만 / 거의 쓸 일 없음)</summary>
+      <div class="row">
+        <label class="field">노션 API 토큰 <span class="muted">(바꿀 때만)</span>
+          <input type="password" id="tokenNew" autocomplete="off" spellcheck="false" placeholder="ntn_…">
+        </label>
+        <label class="field">DB ID <span class="muted">(바꿀 때만)</span>
+          <input type="text" id="dbNew" autocomplete="off" spellcheck="false" placeholder="32자리">
+        </label>
+        <button class="btn" id="btnSaveNotion">저장</button>
+        <button class="btn danger" id="btnNotionOff">노션 기록 끄기</button>
+      </div>
+      <p class="hint">저장하면 담당자 열 목록을 노션에서 다시 읽어 옵니다. 토큰은 이 PC 의 <code>notion_secret.json</code> 에만 저장되고 화면·로그로는 나오지 않습니다. 열만 바꾸려면 위 [담당자 열]에서 고르면 됩니다.</p>
+      <div class="banner" id="adminBanner"></div>
+    </details>
+    <p class="hint" id="columnModeHint">1번 모드는 이 열이 비어 있는 노션 행만 신청합니다(노션에 없는 신규 상품은 제외).</p>
   </section>
 
   <section class="card">
@@ -781,8 +881,11 @@ async function refreshStatus(){
   $("loginPill").title = (login.detail || "") + (login.checked_at ? " · 확인 " + login.checked_at : "");
 
   const n = st.notion || {};
-  if(n.enabled) setPill($("notionPill"), "ok", "노션 연결됨 · " + (n.column || "열 없음"));
-  else setPill($("notionPill"), "bad", "노션 설정 없음(python main.py --setup-notion)");
+  if(n.state === "saved") setPill($("notionPill"), "ok", "노션 설정 저장됨 · " + (n.column || "열 없음"));
+  else if(n.state === "disabled") setPill($("notionPill"), "warn", "노션 기록 꺼짐 · ⚙ 설정 변경에서 켜기");
+  else if(n.state === "incomplete") setPill($("notionPill"), "warn", "노션 설정이 비어 있음 · ⚙ 설정 변경");
+  else setPill($("notionPill"), "bad", "노션 설정 없음 · ⚙ 설정 변경에서 한 번만");
+  $("notionSavedNote").textContent = n.state === "saved" ? "· 저장됨 · 토큰·DB ID 다시 묻지 않음" : "";
 
   const sel = $("column");
   const cols = n.columns || [];
@@ -912,11 +1015,35 @@ $("btnCheckLogin").onclick = async () => {
   banner($("runBanner"), "로그인 상태: " + (r.detail || r.state), r.state === "ok" ? "info" : "err");
   refreshStatus();
 };
-$("btnSaveColumn").onclick = async () => {
-  const r = await api("/api/column", {column: $("column").value});
-  banner($("columnBanner"), r.ok ? `참가자 열을 '${r.column}' 로 저장했습니다.` : r.error, r.ok ? "info" : "err");
+$("btnSaveNotion").onclick = async () => {
+  const token = $("tokenNew").value.trim();
+  const db = $("dbNew").value.trim();
+  if(!token || !db){ banner($("adminBanner"), "노션 API 토큰과 DB ID 를 모두 넣어 주세요.", "err"); return; }
+  $("btnSaveNotion").disabled = true;
+  try{
+    const r = await api("/api/notion-setup", {token, db_id: db, column: $("column").value || ""});
+    if(!r.ok){ banner($("adminBanner"), r.error, "err"); return; }
+    $("tokenNew").value = "";
+    $("dbNew").value = "";
+    banner($("adminBanner"), r.note || `저장했습니다. 담당자 열 '${r.column}' · 이제 토큰·DB ID 는 다시 묻지 않습니다.`, "info");
+    await refreshStatus();
+  } finally {
+    $("btnSaveNotion").disabled = false;
+  }
+};
+$("btnNotionOff").onclick = async () => {
+  if(!confirm("노션 기록을 끌까요? (저장된 토큰은 지우지 않고 끄기만 합니다)")) return;
+  const r = await api("/api/notion-disable", {});
+  banner($("adminBanner"), r.ok ? "노션 기록을 껐습니다. 다시 켜려면 위에서 토큰·DB ID 를 저장하세요." : r.error, r.ok ? "info" : "err");
   refreshStatus();
 };
+$("column").addEventListener("change", async () => {
+  const v = $("column").value;
+  if(!v) return;
+  const r = await api("/api/column", {column: v});
+  if(r.ok) banner($("columnBanner"), `'${r.column}' 열로 기억했습니다. 다음 실행에도 이 열이 기본입니다.`, "info");
+});
+$("column").addEventListener("change", () => { $("previewSummary").style.display = "none"; });
 $("notionAllWrap").style.display = "flex";
 syncLimitChips();
 

@@ -529,7 +529,58 @@ def load_notion_config(path: str | None = None, column: str | None = None) -> di
         print(f"[경고] {p.name} 에 token/db_id 가 비어 있습니다. 노션 기록을 건너뜁니다.")
         return None
     col = str(column or cfg.get("column") or NOTION_DEFAULT_COLUMN).strip() or NOTION_DEFAULT_COLUMN
-    return {"token": token, "db_id": db_id, "column": col, "file": str(p)}
+    cached = [str(c).strip() for c in (cfg.get("_columns") or []) if str(c).strip()]
+    return {"token": token, "db_id": db_id, "column": col, "file": str(p), "columns": cached}
+
+
+def notion_secret_state(path: str | None = None) -> str:
+    """notion_secret.json 의 상태 — 'ok'(저장됨) / 'missing'(없음) / 'disabled'(꺼짐) / 'incomplete'(값 비어 있음).
+
+    'ok' 면 실행할 때 토큰·DB ID 를 다시 묻지 않는다.
+    """
+    p = Path(path or os.environ.get("NOTION_SECRET_FILE") or NOTION_SECRET_FILE)
+    if not p.is_file():
+        return "missing"
+    try:
+        cfg = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return "incomplete"
+    if not isinstance(cfg, dict):
+        return "incomplete"
+    if cfg.get("enabled", True) is False:
+        return "disabled"
+    if not str(cfg.get("token") or "").strip() or not str(cfg.get("db_id") or "").strip():
+        return "incomplete"
+    return "ok"
+
+
+def save_notion_column(column: str, path: str | None = None) -> bool:
+    """notion_secret.json 의 column 값만 바꿔 저장한다(토큰·DB ID·다른 값은 그대로 둔다).
+
+    실행할 때 고른 담당자 열을 기억해 두는 데 쓴다. 저장했으면 True.
+    """
+    column = str(column or "").strip()
+    if not column:
+        return False
+    p = Path(path or os.environ.get("NOTION_SECRET_FILE") or NOTION_SECRET_FILE)
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    if str(data.get("column") or "").strip() == column:
+        return True
+    data["column"] = column
+    try:
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        try:
+            os.chmod(p, 0o600)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
 
 
 def _notion_http(method: str, path: str, payload: dict | None, token: str,
@@ -920,10 +971,12 @@ def notion_list_columns(db_id: str, token: str, transport=None) -> list[str] | N
 
 
 def setup_notion(path: str | None = None, transport=None) -> dict | None:
-    """notion_secret.json 을 대화형으로 만든다.
+    """notion_secret.json 을 대화형으로 만든다(설정 변경용).
 
     순서: ① API 토큰 → ② DB ID(Enter 시 기본값) → ③ DB 스키마를 읽어 참가자 열을 번호로 고르기.
-    저장한 파일은 .gitignore 에 등록되어 있어 커밋되지 않는다. 나중에 column 값은 메모장으로 고쳐도 된다.
+    이미 저장된 설정이 있으면 그 값이 기본값이 되어, 바꾸려는 항목만 입력하면 된다.
+    저장한 파일은 .gitignore 에 등록되어 있어 커밋되지 않는다.
+    이 화면은 '설정 변경'용이고, 실행할 때는 토큰·DB ID 를 묻지 않는다.
     """
     tr = transport or _notion_http
     p = Path(path or NOTION_SECRET_FILE)
@@ -934,16 +987,24 @@ def setup_notion(path: str | None = None, transport=None) -> dict | None:
         except Exception:
             old = {}
 
+    have_saved = bool(str(old.get("token") or "").strip() and str(old.get("db_id") or "").strip())
     print()
     print("=" * 60)
-    print(" 노션 연동 설정 (notion_secret.json 만들기)")
+    print(" 노션 연동 설정 (notion_secret.json)")
     print("=" * 60)
-    print(" 1) 노션에서 통합(토큰)을 만듭니다: https://www.notion.so/my-integrations")
-    print(" 2) 현황표 DB 화면 오른쪽 위 ⋯ → 연결 → 위 통합을 추가합니다.")
-    print(" 3) 아래에 토큰과 DB ID 를 붙여넣으면 열 목록을 보여 줍니다.")
+    if have_saved:
+        print(" 이미 저장된 설정이 있습니다. 이 화면은 '설정 변경'용입니다.")
+        print("   · 그대로 쓸 거면 아무것도 바꾸지 말고 이 창을 닫아도 됩니다(실행할 때 다시 묻지 않습니다).")
+        print(f"   · 지금 저장된 담당자 열: {old.get('column') or NOTION_DEFAULT_COLUMN}")
+        print("   · Enter 만 누르면 저장된 값이 그대로 유지됩니다.")
+    else:
+        print(" 1) 노션에서 통합(토큰)을 만듭니다: https://www.notion.so/my-integrations")
+        print(" 2) 현황표 DB 화면 오른쪽 위 ⋯ → 연결 → 위 통합을 추가합니다.")
+        print(" 3) 아래에 토큰과 DB ID 를 붙여넣으면 열 목록을 보여 줍니다.")
     print()
+    token_hint = " [Enter = 저장된 토큰 그대로]" if str(old.get("token") or "").strip() else ""
     try:
-        token = input("노션 API 토큰(ntn_…): ").strip() or str(old.get("token") or "").strip()
+        token = input(f"노션 API 토큰(ntn_…){token_hint}: ").strip() or str(old.get("token") or "").strip()
     except (EOFError, KeyboardInterrupt):
         print()
         return None
@@ -993,7 +1054,11 @@ def setup_notion(path: str | None = None, transport=None) -> dict | None:
             raw = ""
         column = raw or column
 
-    cfg = {"enabled": True, "token": token, "db_id": db_id, "column": column}
+    cfg = dict(old) if isinstance(old, dict) else {}
+    cfg.update({"enabled": True, "token": token, "db_id": db_id, "column": column})
+    cfg.pop("_단계", None)
+    if cols:
+        cfg["_columns"] = list(cols)   # 열 목록을 기억해 두면 다음에 노션 읽기가 잠시 안 돼도 열을 고를 수 있다
     p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     try:
         os.chmod(p, 0o600)   # 이 파일에는 토큰이 들어 있다
@@ -1001,9 +1066,50 @@ def setup_notion(path: str | None = None, transport=None) -> dict | None:
         pass
     print()
     print(f"[완료] {p.resolve()} 에 저장했습니다. (기록할 열: {column})")
-    print("       열을 바꾸고 싶으면 이 파일을 메모장으로 열어 column 값만 고치면 됩니다.")
+    print("       이제 실행할 때 토큰·DB ID 는 다시 묻지 않고, 담당자 열만 고르면 됩니다.")
+    print("       열을 바꾸고 싶으면 이 파일을 메모장으로 열어 column 값만 고쳐도 됩니다.")
     print("       (토큰이 든 파일이라 .gitignore 에 등록되어 커밋되지 않습니다.)")
     return load_notion_config(str(p))
+
+
+def ask_notion_column(cfg: dict, transport=None) -> str:
+    """'어느 담당자(열)에 기록할지'만 묻는다. 기본값 = notion_secret.json 에 저장된(직전에 고른) 열.
+
+    고른 열은 곧바로 파일에 저장해 다음 실행의 기본값으로 기억한다(토큰·DB ID 는 다시 묻지 않는다).
+    노션에서 열 목록을 읽지 못하면 저장된 열을 그대로 쓰고 묻지 않는다.
+    """
+    saved = str(cfg.get("column") or NOTION_DEFAULT_COLUMN).strip() or NOTION_DEFAULT_COLUMN
+    cols = notion_list_columns(cfg["db_id"], cfg["token"], transport)
+    if not cols:
+        cols = [str(c) for c in (cfg.get("columns") or []) if str(c).strip()]
+    choices = [saved] + [c for c in cols if c != saved]
+    if len(choices) <= 1:
+        print(f"[노션] 기록할 담당자 열: '{saved}' (저장된 열 그대로 · 다시 묻지 않음)")
+        return saved
+    print()
+    print(" 이번에는 어느 담당자 열에 기록할까요?")
+    for i, name in enumerate(choices, 1):
+        print(f"   {i}) {name}" + ("   ← 저장된 열(기본)" if i == 1 else ""))
+    try:
+        raw = input(f" 담당자 열 번호 (그냥 Enter = 1번 {saved}): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        raw = ""
+    pick = saved
+    if raw.isdigit() and 1 <= int(raw) <= len(choices):
+        pick = choices[int(raw) - 1]
+    elif raw in choices:
+        pick = raw
+    elif raw:
+        print(f"  목록에 없는 값이라 저장된 열 '{saved}' 을(를) 씁니다.")
+    if pick != saved:
+        if save_notion_column(pick, cfg.get("file")):
+            print(f"[기억] 이번 실행은 '{pick}' 열 · 다음 실행부터도 '{pick}' 을(를) 기본으로 씁니다.")
+        else:
+            print(f"[안내] 이번 실행만 '{pick}' 열로 기록합니다(설정 파일 저장 실패).")
+    else:
+        print(f"[노션] 기록할 담당자 열: '{pick}'")
+    return pick
 
 
 def ask_run_mode() -> tuple[str, int]:
@@ -1900,6 +2006,8 @@ def main(argv=None) -> int:
                     help="1번 모드에서 카테고리 기준(제외 카테고리·제외 키워드)까지 무시하고 노션 미체크 행 전부를 대상으로 함")
     ap.add_argument("--notion-column", dest="notion_column", default=None,
                     help=f"노션 참가자 열 이름 (기본: notion_secret.json 의 column, 없으면 '{NOTION_DEFAULT_COLUMN}')")
+    ap.add_argument("--ask-column", dest="ask_column", action="store_true",
+                    help="실행 전에 '어느 담당자 열에 기록할지'만 묻는다 (기본값 = 직전에 고른 열 · run_auto.bat 이 사용)")
     ap.add_argument("--setup-notion", dest="setup_notion", action="store_true",
                     help="노션 연동 설정(notion_secret.json)을 대화형으로 만들고 종료")
     ap.add_argument("--no-notion", dest="no_notion", action="store_true",
@@ -1915,6 +2023,7 @@ def main(argv=None) -> int:
 
     # ── 실행 모드/개수: 인자를 주면 그대로, 안 주면 대화형으로 물어본다(배치·자동화는 인자로).
     interactive = (not (args.login or args.login_mobile or args.dry_run)) and sys.stdin.isatty()
+    limit_given = args.limit is not None   # 개수를 안 주면 대화형 마법사(모드→개수→담당자 열)
     mode = "notion" if args.notion_pending else "list"
     if args.limit is None:
         if interactive and mode == "notion":
@@ -1944,13 +2053,18 @@ def main(argv=None) -> int:
                 print(f"[오류] 로그인 실행 실패: {type(exc).__name__}: {exc}")
             return 1
 
-    # ── 노션 설정: 없으면(대화형) 지금 만들지 물어본다. --no-notion 이면 아예 쓰지 않는다.
+    # ── 노션 설정: 한 번 저장해 두면 토큰·DB ID 는 다시 묻지 않는다.
+    #    설정이 없을 때(첫 실행)만 만들지 물어보고, '설정 변경'은 --setup-notion 또는 웹의 ⚙ 설정 변경으로 한다.
     notion_cfg = None
     if not args.no_notion:
+        state = notion_secret_state()
         notion_cfg = load_notion_config(column=args.notion_column)
-        if notion_cfg is None and interactive:
+        if notion_cfg:
+            print(f"[노션] 저장된 설정을 그대로 씁니다 · 담당자 열 '{notion_cfg['column']}'"
+                  " · 토큰·DB ID 는 다시 묻지 않습니다.")
+        elif interactive and state == "missing":
             if ask_yes("노션 연동 설정 파일(notion_secret.json)이 없습니다.\n"
-                       "지금 입력해 저장할까요? (건너뛰려면 Enter)"):
+                       "지금 한 번만 입력해 저장할까요? (건너뛰려면 Enter)"):
                 notion_cfg = setup_notion()
             else:
                 p = Path(NOTION_SECRET_FILE)
@@ -1962,7 +2076,17 @@ def main(argv=None) -> int:
                     except Exception:
                         pass
                 print("[안내] 노션 기록 없이 진행합니다. (나중에 쓰려면 python main.py --setup-notion)")
+        elif state == "disabled":
+            print("[안내] 노션 기록이 꺼져 있습니다(enabled=false). 켜려면 python main.py --setup-notion")
+        elif state == "incomplete":
+            print("[안내] notion_secret.json 의 토큰·DB ID 가 비어 있어 노션 기록을 건너뜁니다."
+                  "\n       채우려면 python main.py --setup-notion")
     args.notion_cfg = notion_cfg
+
+    # ── 담당자(열) 선택: 실행할 때 유일하게 물어보는 노션 항목. 기본값 = 직전에 고른 열.
+    if notion_cfg and not args.notion_column and (args.ask_column or (interactive and not limit_given)):
+        notion_cfg["column"] = ask_notion_column(notion_cfg)
+        args.notion_cfg = notion_cfg
 
     flt = load_filter()
     items = collect_campaigns(args.max_pages)
