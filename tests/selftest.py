@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -74,7 +75,7 @@ def build_item(title, cats):
 
 
 def test_filter():
-    print("[1/2] 필터 검증")
+    print("[1/4] 필터 검증")
     flt = main.load_filter()
     cases = {
         "수플린 설향딸기 800g": "allow",
@@ -337,7 +338,7 @@ class FakePage:
 
 
 def test_apply_flow():
-    print("[2/2] 신청 플로우 검증 (가짜 브라우저)")
+    print("[2/4] 신청 플로우 검증 (가짜 브라우저)")
     campaign = {
         "campaignId": "abc",
         "campaignTitle": "테스트 상품",
@@ -460,6 +461,310 @@ def test_apply_flow():
     main.apply_one(page, campaign)
     check("배송지가 비면 선택 단계 수행", any("선택하기" in c for c in page.clicks), str(page.clicks))
 
+    # 16) 대기 위치: 신청 후가 아니라 [신청 완료하기] 클릭 직전
+    events = []
+    orig_sleep = time.sleep
+    time.sleep = lambda sec: events.append(("sleep", sec))
+    try:
+        page = FakePage(["신청 완료하기", "확인"], ADDR)
+        orig_click = page.handle_click
+        page.handle_click = lambda text: (events.append(("click", text)), orig_click(text))[1]
+        res = main.apply_one(page, campaign, pre_submit_delay=(3.0, 3.0))
+    finally:
+        time.sleep = orig_sleep
+    sleeps = [e for e in events if e[0] == "sleep"]
+    first_submit = next((i for i, e in enumerate(events)
+                         if e[0] == "click" and "신청" in e[1]), None)
+    first_sleep = next((i for i, e in enumerate(events) if e[0] == "sleep"), None)
+    check("[신청 완료하기] 직전에 대기", res["status"] == "성공" and first_sleep is not None
+          and first_submit is not None and first_sleep < first_submit, str(events[:6]))
+    check("대기 시간이 --delay 값을 따른다", any(abs(v - 3.0) < 1e-9 for _, v in sleeps), str(sleeps))
+
+
+
+# ------------------------------------------------- 4부: 노션 기록·설정·모드 검증
+def notion_row(page_id, cid, title, mark="", column=None):
+    """노션 DB 행 하나(가짜 응답용)."""
+    column = column or main.NOTION_DEFAULT_COLUMN
+    rt = [{"type": "text", "text": {"content": mark}, "plain_text": mark}] if mark else []
+    return {
+        "id": page_id,
+        "properties": {
+            "링크": {"type": "url", "url": main.DETAIL_PAGE.format(cid=cid)},
+            "상품명·브랜드": {"type": "title", "title": [
+                {"type": "text", "text": {"content": title}, "plain_text": title}]},
+            column: {"type": "rich_text", "rich_text": rt},
+        },
+    }
+
+
+class NotionStub:
+    """노션 API 가짜 서버 — query / pages 생성 / pages 갱신 / DB 스키마 조회."""
+
+    def __init__(self, rows=None, schema=None, fail=None):
+        self.rows = list(rows or [])
+        self.schema = schema
+        self.fail = fail        # (status, data, err) 를 모든 호출에 그대로 돌려준다
+        self.calls = []
+        self.patches = {}
+
+    def __call__(self, method, path, payload, token, timeout=None):
+        self.calls.append((method, path, payload))
+        if self.fail is not None:
+            return self.fail
+        if method == "GET" and path.startswith("/databases/"):
+            return 200, {"object": "database", "properties": self.schema or {}}, None
+        if method == "POST" and path.endswith("/query"):
+            flt = (payload or {}).get("filter") or {}
+            rows = self._match(flt) if flt else list(self.rows)
+            return 200, {"results": rows, "has_more": False, "next_cursor": None}, None
+        if method == "POST" and path == "/pages":
+            props = (payload or {}).get("properties") or {}
+            page_id = f"new-{len(self.calls)}"
+            self.rows.append({"id": page_id, "properties": _props_from_payload(props)})
+            return 200, {"id": page_id}, None
+        if method == "PATCH" and path.startswith("/pages/"):
+            page_id = path.rsplit("/", 1)[-1]
+            self.patches[page_id] = (payload or {}).get("properties") or {}
+            return 200, {"id": page_id}, None
+        return 404, {"message": "not found"}, None
+
+    def _match(self, flt):
+        prop = flt.get("property")
+        cond = flt.get("url") or flt.get("title") or {}
+        needle = cond.get("contains") or ""
+        out = []
+        for row in self.rows:
+            val = main._plain(row["properties"].get(prop))
+            if needle and needle in val:
+                out.append(row)
+        return out
+
+    def posted_props(self):
+        for method, path, payload in self.calls:
+            if method == "POST" and path == "/pages":
+                return (payload or {}).get("properties") or {}
+        return {}
+
+
+def _props_from_payload(props):
+    """POST /pages 로 보낸 속성 → 응답 모양(plain_text 포함)."""
+    out = {}
+    for name, val in props.items():
+        for kind in ("title", "rich_text"):
+            if kind in val:
+                chunks = [{"type": "text", "text": c["text"],
+                           "plain_text": c["text"]["content"]} for c in val[kind]]
+                out[name] = {"type": kind, kind: chunks}
+                break
+        if "url" in val:
+            out[name] = {"type": "url", "url": val["url"]}
+    return out
+
+
+class FakeInput:
+    def __init__(self, answers):
+        self.answers = list(answers)
+        self.prompts = []
+
+    def __call__(self, prompt=""):
+        self.prompts.append(prompt)
+        if not self.answers:
+            raise EOFError
+        return self.answers.pop(0)
+
+
+class use_input:
+    """input() 을 잠시 바꿔 쓴다."""
+
+    def __init__(self, answers):
+        self.fake = FakeInput(answers)
+
+    def __enter__(self):
+        import builtins
+        self._old = builtins.input
+        builtins.input = self.fake
+        return self.fake
+
+    def __exit__(self, *exc):
+        import builtins
+        builtins.input = self._old
+        return False
+
+
+def test_notion():
+    print("[4/4] 노션 기록·설정·실행 모드 검증 (가짜 노션 API)")
+    NOW = datetime(2026, 11, 20, 11, 0, 0)
+    CFG = {"token": "ntn_dummy", "db_id": "db-dummy", "column": "메인.엽", "file": "notion_secret.json"}
+    item = {
+        "campaignId": "abc123",
+        "title": "핫팩 10개입",
+        "brand": "테스트브랜드",
+        "option": "화이트",
+        "skip_wishlist": False,
+        "applicationCount": 120,
+        "recruitmentCount": 10,
+        "remainingDays": 3,
+        "status": "성공",
+    }
+
+    # 1) 신규 행 생성
+    stub = NotionStub()
+    rec = main.notion_record(CFG, item, transport=stub, now=NOW)
+    check("노션: 새 캠페인 → 행 생성", rec["status"] == "created", f"{rec}")
+    props = stub.posted_props()
+    sent_title = "".join(c["text"]["content"] for c in props.get("상품명·브랜드", {}).get("title", []))
+    check("노션: 상품명·브랜드(title)에 [브랜드] 붙여 기록", sent_title == "[테스트브랜드] 핫팩 10개입",
+          sent_title)
+    check("노션: 링크(url) 기록", props.get("링크", {}).get("url", "").endswith("/trial-campaign/abc123"),
+          str(props.get("링크")))
+    check("노션: 옵션 기록",
+          props.get("옵션", {}).get("rich_text", [{}])[0].get("text", {}).get("content") == "화이트",
+          str(props.get("옵션"))[:120])
+    check("노션: 메커니즘 '상세→위시→옵션→신청'",
+          props.get("메커니즘", {}).get("rich_text", [{}])[0].get("text", {}).get("content") == "상세→위시→옵션→신청",
+          str(props.get("메커니즘"))[:120])
+    check("노션: 마감일·모집현황 'D-3 · 120/10명'",
+          props.get("마감일·모집현황", {}).get("rich_text", [{}])[0].get("text", {}).get("content") == "D-3 · 120/10명",
+          str(props.get("마감일·모집현황"))[:120])
+    check("노션: 내 열에 '11/20 O'",
+          props.get("메인.엽", {}).get("rich_text", [{}])[0].get("text", {}).get("content") == "11/20 O",
+          str(props.get("메인.엽"))[:120])
+
+    # 2) 기존 행(내 열 비어 있음) → 새 행 없이 PATCH
+    stub = NotionStub(rows=[notion_row("p1", "abc123", "[테스트] 테스트 핫팩 10개입")])
+    rec = main.notion_record(CFG, item, transport=stub, now=NOW)
+    check("노션: 기존 행 → 갱신(PATCH)", rec["status"] == "updated", f"{rec}")
+    check("노션: 기존 행에는 POST /pages 없음",
+          not any(m == "POST" and p == "/pages" for m, p, _ in stub.calls), str(stub.calls)[:160])
+    check("노션: 갱신은 내 열만 보낸다",
+          list(stub.patches.get("p1", {}).keys()) == ["메인.엽"], str(stub.patches.get("p1"))[:160])
+
+    # 3) 같은 날 이미 기록됨 → 그대로 둔다
+    stub = NotionStub(rows=[notion_row("p1", "abc123", "t", mark="11/20 O")])
+    rec = main.notion_record(CFG, item, transport=stub, now=NOW)
+    check("노션: 오늘 날짜 기록 있음 → unchanged", rec["status"] == "unchanged", f"{rec}")
+    check("노션: unchanged 면 PATCH 하지 않음", stub.patches == {}, str(stub.patches))
+
+    # 4) 다른 날 기록만 있음 → 기존 내용 유지 + 줄바꿈으로 덧붙임
+    stub = NotionStub(rows=[notion_row("p1", "abc123", "t", mark="11/19")])
+    rec = main.notion_record(CFG, item, transport=stub, now=NOW)
+    new = "".join(c["text"]["content"] for c in stub.patches["p1"]["메인.엽"]["rich_text"])
+    check("노션: 기존 기록 유지 + 덧붙임", rec["status"] == "updated" and new == "11/19\n11/20 O", f"{rec} / {new!r}")
+
+    # 5) 다른 계정 열을 쓰면 그 열에만 기록
+    cfg2 = dict(CFG, column="서브.동")
+    stub = NotionStub(rows=[notion_row("p2", "abc123", "t", mark="11/20", column="서브.동")])
+    rec = main.notion_record(cfg2, item, transport=stub, now=NOW)
+    check("노션: --notion-column 열 기준으로 중복 판정", rec["status"] == "unchanged", f"{rec}")
+
+    # 5-1) 노션 검색 지연 대비 — 이번 배치 색인으로도 중복을 막는다
+    rec = main.notion_record(CFG, item, transport=NotionStub(), now=NOW,
+                             index={"abc123": {"page_id": "p9", "mark": "11/20 O"}})
+    check("노션: 색인에 오늘 기록이 있으면 unchanged", rec["status"] == "unchanged", f"{rec}")
+    stub = NotionStub()
+    rec = main.notion_record(CFG, item, transport=stub, now=NOW,
+                             index={"abc123": {"page_id": "p9", "mark": ""}})
+    check("노션: 색인 행이 미체크면 그 행을 갱신", rec["status"] == "updated" and "p9" in stub.patches, f"{rec}")
+    idx = {}
+    stub = NotionStub()
+    rec = main.notion_record(CFG, item, transport=stub, now=NOW, index=idx)
+    check("노션: 생성 후 배치 색인에 등록", rec["status"] == "created"
+          and idx.get("abc123", {}).get("mark") == "11/20 O", str(idx))
+    rec = main.notion_record(CFG, item, transport=stub, now=NOW, index=idx)
+    check("노션: 같은 배치에서 두 번째 기록 → 중복 생성 없음", rec["status"] == "unchanged", f"{rec}")
+
+    # 6) 노션 오류가 나도 예외 없이 failed
+    stub = NotionStub(fail=(500, {"message": "internal error"}, "boom"))
+    rec = main.notion_record(CFG, item, transport=stub, now=NOW)
+    check("노션: 오류 → 예외 없이 failed", rec["status"] == "failed" and "HTTP 500" in rec["detail"], f"{rec}")
+    stub = NotionStub(fail=(None, None, "URLError: timeout"))
+    rec = main.notion_record(CFG, item, transport=stub, now=NOW)
+    check("노션: 네트워크 오류 → failed", rec["status"] == "failed", f"{rec}")
+
+    # 7) 설정 파일: 없음/꺼짐/열 덮어쓰기
+    check("노션: notion_secret.json 없음 → 기록 안 함(None)",
+          main.load_notion_config(path=str(ROOT / "logs" / "_no_such_notion.json")) is None)
+    tmp = ROOT / "logs" / "_test_notion_secret.json"
+    tmp.parent.mkdir(exist_ok=True)
+    tmp.write_text(json.dumps({"enabled": False, "token": "x", "db_id": "y"}, ensure_ascii=False),
+                   encoding="utf-8")
+    check("노션: enabled=false → 기록 안 함(None)", main.load_notion_config(path=str(tmp)) is None)
+    tmp.write_text(json.dumps({"token": "ntn_x", "db_id": "d", "column": "메인.엽"}, ensure_ascii=False),
+                   encoding="utf-8")
+    cfg3 = main.load_notion_config(path=str(tmp))
+    check("노션: column 없으면 기본 '메인.엽'", cfg3["column"] == "메인.엽", str(cfg3))
+    cfg3 = main.load_notion_config(path=str(tmp), column="서브.택")
+    check("노션: CLI 열 이름이 파일보다 우선", cfg3["column"] == "서브.택", str(cfg3))
+
+    # 8) DB 전체 읽기 + 미체크 필터(모드 1)
+    stub = NotionStub(rows=[
+        notion_row("p1", "aaa", "체크된 상품", mark="11/20"),
+        notion_row("p2", "bbb", "미체크 상품"),
+        notion_row("p3", "ccc", "다른 열만 체크", mark="11/20", column="서브.동"),
+    ])
+    scan = main.notion_scan(CFG, transport=stub)
+    check("노션: DB 스캔으로 campaignId→행 매핑", set(scan) == {"aaa", "bbb", "ccc"}, str(scan.keys()))
+    cands = [{"campaignId": "bbb"}, {"campaignId": "aaa"}, {"campaignId": "ddd"}, {"campaignId": "ccc"}]
+    ordered, stat = main.order_by_notion(cands, scan)
+    check("모드1: 내 열 체크된 캠페인 제외", [c["campaignId"] for c in ordered] == ["bbb", "ccc", "ddd"],
+          str([c["campaignId"] for c in ordered]))
+    check("모드1: 미체크(DB 등록) 먼저 → 신규 다음",
+          stat["checked"] == 1 and stat["pending"] == 2 and stat["fresh"] == 1, str(stat))
+
+    # 9) 스키마에서 참가자 열 후보 추리기
+    schema = {
+        "상품명·브랜드": {"type": "title"},
+        "링크": {"type": "url"},
+        "등록일": {"type": "created_time"},
+        "메커니즘": {"type": "rich_text"},
+        "옵션": {"type": "rich_text"},
+        "마감일·모집현황": {"type": "rich_text"},
+        "서브.동": {"type": "rich_text"},
+        "메인.엽": {"type": "rich_text"},
+        "1팀.엽2(2200)": {"type": "rich_text"},
+    }
+    stub = NotionStub(schema=schema)
+    cols = main.notion_list_columns("db-dummy", "ntn_dummy", transport=stub)
+    check("설정: 메타 열(옵션·메커니즘·마감일) 제외", not ({"옵션", "메커니즘", "마감일·모집현황"} & set(cols)),
+          str(cols))
+    check("설정: 기본 열(메인.엽)이 1번", cols[0] == "메인.엽", str(cols))
+    check("설정: 참가자 열 후보 3개", len(cols) == 3, str(cols))
+
+    # 10) 설정 마법사: 토큰 → DB ID(Enter 기본) → 열 번호 → 파일 저장
+    stub = NotionStub(schema=schema)
+    path = ROOT / "logs" / "_test_setup_notion.json"
+    path.unlink(missing_ok=True)
+    with use_input(["ntn_setup_token", "", "2"]):
+        cfg = main.setup_notion(path=str(path), transport=stub)
+    saved = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    check("설정: notion_secret.json 자동 생성", path.is_file() and cfg is not None, str(saved))
+    check("설정: 토큰 저장", saved.get("token") == "ntn_setup_token", str(saved.get("token")))
+    check("설정: DB ID Enter → 기본값",
+          saved.get("db_id") == main.NOTION_DEFAULT_DB_ID, str(saved.get("db_id")))
+    check("설정: 고른 번호(2번) 열 저장", saved.get("column") == cols[1], str(saved.get("column")))
+    check("설정: 저장된 파일을 그대로 다시 읽는다", main.load_notion_config(path=str(path)) is not None)
+    path.unlink(missing_ok=True)
+    tmp.unlink(missing_ok=True)
+
+    # 11) 개수 입력: Enter = 기본, 숫자만 인정
+    with use_input(["", "10", "abc", "7"]) as fake:
+        check("입력: Enter → 기본 30", main.ask_limit() == 30)
+        check("입력: 숫자 → 그 값", main.ask_limit() == 10)
+        check("입력: 문자는 다시 묻는다", main.ask_limit() == 7, str(fake.prompts[-1:]))
+    with use_input([]):
+        check("입력: EOF → 기본값", main.ask_limit(50) == 50)
+
+    # 12) 표시 문자열
+    check("노션: 마감 정보 없으면 '마감일 미확인'",
+          main.notion_status_text({"applicationCount": 1, "recruitmentCount": 2}).startswith("마감일 미확인"),
+          main.notion_status_text({"applicationCount": 1, "recruitmentCount": 2}))
+    check("노션: 옵션 없으면 메커니즘에 옵션 없음",
+          main.notion_mechanism({"option": "", "skip_wishlist": False}) == "상세→위시→신청",
+          main.notion_mechanism({"option": "", "skip_wishlist": False}))
+    check("노션: 제출 직전 대기 파라미터가 apply_one 에 있다",
+          "pre_submit_delay" in main.apply_one.__code__.co_varnames,
+          str(main.apply_one.__code__.co_varnames))
 
 
 def cleanup():
@@ -468,7 +773,7 @@ def cleanup():
 
 
 def test_login_logic():
-    print("[3/3] 로그인 로직 검증 (네트워크 없이)")
+    print("[3/4] 로그인 로직 검증 (네트워크 없이)")
     url = main._login_url()
     check("로그인 주소가 웹 로그인 입구(shopping-userauth-web)인가",
           url.startswith("https://shopping-userauth-web.kakao.com/login?channel=GIFT&redirect_url="), url[:80])
@@ -541,6 +846,7 @@ if __name__ == "__main__":
     test_filter()
     test_apply_flow()
     test_login_logic()
+    test_notion()
     cleanup()
     print()
     if FAILS:

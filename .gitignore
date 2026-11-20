@@ -15,3 +15,7 @@ venv/
 
 # 환경변수
 .env
+
+# 노션 연동 설정(API 토큰 포함) — 절대 커밋 금지
+# 예시는 notion_secret.example.json 을 보세요.
+notion_secret.json

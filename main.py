@@ -86,6 +86,26 @@ LIST_SORT_PROPERTY = "CREATED_AT"
 PAGE_SIZE = 50
 
 # ---------------------------------------------------------------------------
+# 0-B. 노션 기록 상수 (선택 사항 — notion_secret.json 이 있을 때만 동작)
+#   ⚠️ notion_secret.json 에는 API 토큰이 들어 있으므로 절대 커밋하지 않는다(.gitignore 등록).
+# ---------------------------------------------------------------------------
+NOTION_SECRET_FILE = "notion_secret.json"
+NOTION_API = "https://api.notion.com/v1"
+NOTION_VERSION = "2022-06-28"
+NOTION_DEFAULT_COLUMN = "메인.엽"   # 참가자 열 기본값
+NOTION_DEFAULT_DB_ID = "41a27dbe-a669-8193-9138-de51fa8dfb1c"   # 신엽 님 현황표(입력 시 기본값)
+NOTION_TIMEOUT = 15
+NOTION_TEXT_MAX = 2000
+# 참가자 열이 아닌 rich_text 메타 열(설정 시 열 목록에서 잴 제외)
+NOTION_META_COLUMNS = ("단계", "옵션", "메커니즘", "마감일·모집현황")
+
+# 신청 개수 기본값 (대화형 실행에서 Enter 만 눌렀을 때)
+LIMIT_DEFAULT = 30
+LIMIT_DEFAULT_UNCHECKED = 50   # 노션 미체크 모드(1번) 기본값
+# 신청 1건을 마친 뒤 다음 상품으로 넘어가기 전 대기(짧게). 긴 대기는 [신청 완료하기] 직전에 한다.
+GAP_MIN, GAP_MAX = 0.5, 1.0
+
+# ---------------------------------------------------------------------------
 # 1. 사용자 맞춤 필터 기본값 (config.json 이 있으면 그 값으로 덮어쓴다)
 #    카테고리 ID와 이름은 gift.kakao.com 실제 응답에서 확인한 값.
 # ---------------------------------------------------------------------------
@@ -429,6 +449,446 @@ def save_results_csv(results: list, path: Path | None = None) -> Path:
                 row.get("status", ""), row.get("reason", ""),
             ])
     return path
+
+
+# ---------------------------------------------------------------------------
+# 4-B. 노션 기록 (선택 사항)
+#   신청 성공 건을 노션 DB 에 자동 기록한다. 같은 캠페인은 새 행을 만들지 않고
+#   지정된 참가자 열(예: 메인.엽)만 갱신한다(중복 행 방지).
+#   notion_secret.json 이 없거나 "enabled": false 면 조용히 건너뛰고 CSV 저장만 한다.
+#   네트워크·노션 오류는 신청 루프를 죽이지 않는다(결과 요약에 성공/실패 건수만 남김).
+# ---------------------------------------------------------------------------
+def load_notion_config(path: str | None = None, column: str | None = None) -> dict | None:
+    """notion_secret.json 을 읽는다. 파일이 없거나 enabled=false 면 None(기록 안 함).
+
+    파일 형식(예시는 notion_secret.example.json):
+        {"enabled": true, "token": "ntn_...", "db_id": "....", "column": "메인.엽"}
+    """
+    p = Path(path or os.environ.get("NOTION_SECRET_FILE") or NOTION_SECRET_FILE)
+    if not p.is_file():
+        return None
+    try:
+        cfg = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[경고] {p.name} 을(를) 읽지 못했습니다({type(exc).__name__}). 노션 기록을 건너뜁니다.")
+        return None
+    if not isinstance(cfg, dict) or cfg.get("enabled", True) is False:
+        return None
+    token = str(cfg.get("token") or "").strip()
+    db_id = str(cfg.get("db_id") or "").strip()
+    if not token or not db_id:
+        print(f"[경고] {p.name} 에 token/db_id 가 비어 있습니다. 노션 기록을 건너뜁니다.")
+        return None
+    col = str(column or cfg.get("column") or NOTION_DEFAULT_COLUMN).strip() or NOTION_DEFAULT_COLUMN
+    return {"token": token, "db_id": db_id, "column": col, "file": str(p)}
+
+
+def _notion_http(method: str, path: str, payload: dict | None, token: str,
+                 timeout: int = NOTION_TIMEOUT):
+    """노션 API 호출 → (status, data, error). 예외를 던지지 않는다."""
+    url = NOTION_API + path
+    body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method=method, headers={
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return resp.status, (json.loads(raw) if raw.strip() else {}), None
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = None
+        return exc.code, data, raw[:200]
+    except Exception as exc:
+        return None, None, f"{type(exc).__name__}: {exc}"
+
+
+def _notion_err(data, status, err) -> str:
+    if isinstance(data, dict):
+        msg = data.get("message") or data.get("code") or ""
+        if msg:
+            return f"HTTP {status} {msg}"[:120]
+    return f"HTTP {status} {str(err or '')[:80]}"
+
+
+def _rt(text: str) -> list:
+    """문자열 → 노션 rich_text / title 배열(빈 문자열은 빈 배열)."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    return [{"type": "text", "text": {"content": text[:NOTION_TEXT_MAX]}}]
+
+
+def _plain(prop: dict | None) -> str:
+    """노션 속성 하나의 표시 문자열."""
+    prop = prop or {}
+    kind = prop.get("type")
+    if kind == "title":
+        chunks = prop.get("title") or []
+    elif kind == "rich_text":
+        chunks = prop.get("rich_text") or []
+    elif kind == "url":
+        return prop.get("url") or ""
+    else:
+        chunks = []
+    return "".join(c.get("plain_text") or "" for c in chunks)
+
+
+def _cid_from_link(link: str) -> str:
+    m = re.search(r"/trial-campaign/([0-9A-Za-z\-]+)", link or "")
+    return m.group(1) if m else ""
+
+
+def notion_mark(now: datetime | None = None) -> str:
+    """참가자 열에 남기는 표시 — 예: '11/20 O'"""
+    now = now or datetime.now()
+    return f"{now.month}/{now.day} O"
+
+
+def notion_row_title(item: dict) -> str:
+    """상품명·브랜드(title) 값. 브랜드가 상품명에 없을 때만 [브랜드] 를 앞에 붙인다."""
+    title = (item.get("title") or "").strip()
+    brand = (item.get("brand") or "").strip()
+    if brand and brand not in title:
+        return f"[{brand}] {title}"
+    return title
+
+
+def notion_status_text(item: dict) -> str:
+    """마감일·모집현황 — 예: 'D-3 · 120/10명'"""
+    days = item.get("remainingDays")
+    count = item.get("applicationCount") or 0
+    recruit = item.get("recruitmentCount") or 0
+    head = f"D-{days}" if days is not None else "마감일 미확인"
+    return f"{head} · {count}/{recruit}명"
+
+
+def notion_mechanism(item: dict) -> str:
+    """메커니즘 — 예: '상세→위시→옵션→신청'"""
+    steps = ["상세"]
+    if not item.get("skip_wishlist"):
+        steps.append("위시")
+    if (item.get("option") or "").strip():
+        steps.append("옵션")
+    steps.append("신청")
+    return "→".join(steps)
+
+
+def notion_properties(item: dict, column: str, mark: str, with_details: bool = True) -> dict:
+    """노션 속성 묶음. with_details=False 면 참가자 열만(기존 행 갱신용)."""
+    props = {column: {"rich_text": _rt(mark)}}
+    if not with_details:
+        return props
+    props["상품명·브랜드"] = {"title": _rt(notion_row_title(item))}
+    props["링크"] = {"url": DETAIL_PAGE.format(cid=(item.get("campaignId") or ""))}
+    props["옵션"] = {"rich_text": _rt(item.get("option") or "")}
+    props["메커니즘"] = {"rich_text": _rt(notion_mechanism(item))}
+    props["마감일·모집현황"] = {"rich_text": _rt(notion_status_text(item))}
+    return props
+
+
+def _notion_find_row(cfg: dict, item: dict, tr):
+    """같은 캠페인의 기존 행 찾기 → ({"page_id", "mark"} | None, error|None).
+
+    1차: 링크(url)에 campaignId 포함, 2차: 상품명·브랜드(title) 포함.
+    2차로 찾은 행의 링크가 다른 캠페인이면 건너뛴다(이름만 같은 다른 상품 보호).
+    """
+    cid = (item.get("campaignId") or "").strip()
+    title = (item.get("title") or "").strip()
+    queries = []
+    if cid:
+        queries.append({"property": "링크", "url": {"contains": cid}})
+    if title:
+        queries.append({"property": "상품명·브랜드", "title": {"contains": title[:80]}})
+    for flt in queries:
+        status, data, err = tr("POST", f"/databases/{cfg['db_id']}/query",
+                               {"filter": flt, "page_size": 5}, cfg["token"])
+        if status != 200 or not isinstance(data, dict):
+            return None, _notion_err(data, status, err)
+        for row in data.get("results") or []:
+            props = row.get("properties") or {}
+            row_cid = _cid_from_link(_plain(props.get("링크")))
+            if row_cid and cid and row_cid != cid:
+                continue
+            return {"page_id": row.get("id"), "mark": _plain(props.get(cfg["column"]))}, None
+    return None, None
+
+
+def notion_record(cfg: dict, item: dict, transport=None, now: datetime | None = None,
+                  index: dict | None = None) -> dict:
+    """신청 성공 1건을 노션 DB 에 기록한다(중복 행 방지).
+
+    index: 이번 배치에서 읽어 둔 {campaignId: {"page_id", "mark"}} 색인.
+           노션 검색(쿼리)은 새로 만든 행이 몇 초 뒤에야 잡히기 때문에, 같은 실행 안에서
+           같은 상품이 두 번 기록되지 않도록 색인도 함께 본다. 없으면 쿼리만 쓴다.
+
+    반환: {"status": created|updated|unchanged|failed, "detail": str}
+      created   새 행 생성
+      updated   기존 행의 참가자 열 갱신
+      unchanged 이미 오늘 날짜로 기록돼 있음(그대로 둠)
+      failed    노션/네트워크 오류(신청 자체는 이미 성공)
+    """
+    tr = transport or _notion_http
+    column = cfg["column"]
+    mark = notion_mark(now)
+    cid = (item.get("campaignId") or "").strip()
+    try:
+        found, err = _notion_find_row(cfg, item, tr)
+        if err:
+            return {"status": "failed", "detail": err}
+        if found is None and index is not None and cid in index:
+            found = {"page_id": index[cid].get("page_id"), "mark": index[cid].get("mark") or ""}
+        if found:
+            page_id = found["page_id"]
+            cur = (found.get("mark") or "").strip()
+            if not cur:
+                new = mark
+            elif mark.split()[0] in cur:      # 오늘 날짜가 이미 적혀 있으면 손대지 않는다
+                return {"status": "unchanged", "detail": "이미 기록됨"}
+            else:
+                new = f"{cur}\n{mark}"        # 기존 내용은 지우지 않고 줄을 바꿔 덧붙인다
+            status, data, err2 = tr(
+                "PATCH", f"/pages/{page_id}",
+                {"properties": notion_properties(item, column, new, with_details=False)},
+                cfg["token"],
+            )
+            if status not in (200,):
+                return {"status": "failed", "detail": _notion_err(data, status, err2)}
+            if index is not None and cid:
+                index[cid] = {"page_id": page_id, "mark": new}
+            return {"status": "updated", "detail": "기존 행 갱신"}
+
+        status, data, err3 = tr("POST", "/pages", {
+            "parent": {"database_id": cfg["db_id"]},
+            "properties": notion_properties(item, column, mark),
+        }, cfg["token"])
+        if status not in (200, 201):
+            return {"status": "failed", "detail": _notion_err(data, status, err3)}
+        if index is not None and cid:
+            index[cid] = {"page_id": (data or {}).get("id"), "mark": mark}
+        return {"status": "created", "detail": "새 행 생성"}
+    except Exception as exc:          # 어떤 경우에도 신청 루프는 계속된다
+        return {"status": "failed", "detail": f"{type(exc).__name__}: {str(exc)[:80]}"}
+
+
+def notion_scan(cfg: dict, transport=None) -> dict | None:
+    """노션 DB 전체를 읽어 {campaignId: {"page_id", "title", "mark"}} 로 돌려준다.
+
+    조회에 실패하면 None — 호출 쪽(mode 1)은 이때 신청을 진행하지 않는다(중복 신청 방지).
+    """
+    tr = transport or _notion_http
+    column = cfg["column"]
+    out, cursor, pages = {}, None, 0
+    while pages < 50:
+        payload = {"page_size": 100}
+        if cursor:
+            payload["start_cursor"] = cursor
+        status, data, err = tr("POST", f"/databases/{cfg['db_id']}/query", payload, cfg["token"])
+        if status != 200 or not isinstance(data, dict):
+            print(f"[경고] 노션 DB 조회 실패({_notion_err(data, status, err)})")
+            return None
+        for row in data.get("results") or []:
+            props = row.get("properties") or {}
+            cid = _cid_from_link(_plain(props.get("링크")))
+            if not cid:
+                continue
+            out[cid] = {
+                "page_id": row.get("id"),
+                "title": _plain(props.get("상품명·브랜드")),
+                "mark": _plain(props.get(column)),
+            }
+        cursor = data.get("next_cursor")
+        pages += 1
+        if not data.get("has_more") or not cursor:
+            break
+    return out
+
+
+def order_by_notion(candidates: list, scan: dict) -> tuple[list, dict]:
+    """mode 1: 내 열에 체크가 안 된 것만 추린다.
+
+    · 노션 DB 에 이미 있고 내 열이 비어 있는 행 → 먼저
+    · 노션 DB 에 아예 없는(신규) 행 → 그 다음
+    · 노션 DB 에 있고 내 열이 채워진 행 → 제외
+    """
+    pending, fresh, checked = [], [], 0
+    for item in candidates:
+        row = scan.get(item.get("campaignId") or "")
+        if row is None:
+            fresh.append(item)
+        elif (row.get("mark") or "").strip():
+            checked += 1
+        else:
+            pending.append(item)
+    return pending + fresh, {"checked": checked, "pending": len(pending), "fresh": len(fresh)}
+
+
+def ask_limit(default: int = LIMIT_DEFAULT, prompt: str | None = None) -> int:
+    """신청 개수를 물어본다(Enter = 기본값, 숫자만 허용)."""
+    prompt = prompt or f"몇 개 신청할까요? (그냥 Enter 시 기본 {default}개): "
+    while True:
+        try:
+            raw = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return default
+        if raw == "":
+            return default
+        if raw.isdigit() and int(raw) > 0:
+            return int(raw)
+        print("  숫자만 입력해 주세요. (예: 30)")
+
+
+def ask_yes(prompt: str) -> bool:
+    """예/아니오 한 번 물어보기(Enter = 아니오)."""
+    try:
+        raw = input(prompt + " [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return raw in ("y", "yes", "예", "네", "1")
+
+
+def notion_list_columns(db_id: str, token: str, transport=None) -> list[str] | None:
+    """노션 DB 스키마를 읽어 '기록할 참가자 열' 후보 rich_text 열을 돌려준다.
+
+    메타 열(옵션·메커니즘·마감일·모집현황)은 제외하고, 기본 열(메인.엽)을 맨 앞에 둔다.
+    읽지 못하면 None.
+    """
+    tr = transport or _notion_http
+    status, data, err = tr("GET", f"/databases/{db_id}", None, token)
+    if status != 200 or not isinstance(data, dict):
+        print(f"[경고] 노션 DB 스키마 조회 실패({_notion_err(data, status, err)})")
+        return None
+    cols = []
+    for name, prop in (data.get("properties") or {}).items():
+        if (prop or {}).get("type") != "rich_text":
+            continue
+        if name in NOTION_META_COLUMNS:
+            continue
+        cols.append(name)
+    if not cols:
+        return None
+    cols.sort(key=lambda n: (0 if n == NOTION_DEFAULT_COLUMN else 1, n))
+    return cols
+
+
+def setup_notion(path: str | None = None, transport=None) -> dict | None:
+    """notion_secret.json 을 대화형으로 만든다.
+
+    순서: ① API 토큰 → ② DB ID(Enter 시 기본값) → ③ DB 스키마를 읽어 참가자 열을 번호로 고르기.
+    저장한 파일은 .gitignore 에 등록되어 있어 커밋되지 않는다. 나중에 column 값은 메모장으로 고쳐도 된다.
+    """
+    tr = transport or _notion_http
+    p = Path(path or NOTION_SECRET_FILE)
+    old = {}
+    if p.is_file():
+        try:
+            old = json.loads(p.read_text(encoding="utf-8")) or {}
+        except Exception:
+            old = {}
+
+    print()
+    print("=" * 60)
+    print(" 노션 연동 설정 (notion_secret.json 만들기)")
+    print("=" * 60)
+    print(" 1) 노션에서 통합(토큰)을 만듭니다: https://www.notion.so/my-integrations")
+    print(" 2) 현황표 DB 화면 오른쪽 위 ⋯ → 연결 → 위 통합을 추가합니다.")
+    print(" 3) 아래에 토큰과 DB ID 를 붙여넣으면 열 목록을 보여 줍니다.")
+    print()
+    try:
+        token = input("노션 API 토큰(ntn_…): ").strip() or str(old.get("token") or "").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if not token:
+        print("[안내] 토큰이 입력되지 않아 설정을 만들지 않았습니다.")
+        return None
+
+    db_default = str(old.get("db_id") or NOTION_DEFAULT_DB_ID).strip()
+    hint = f" (그냥 Enter = {db_default})" if db_default else ""
+    try:
+        raw = input(f"노션 DB ID{hint}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    db_id = raw or db_default
+    if not db_id:
+        print("[안내] DB ID 가 없어 설정을 만들지 않았습니다.")
+        return None
+
+    # ③ 스키마를 읽어 참가자 열을 번호로 고른다.
+    column = str(old.get("column") or NOTION_DEFAULT_COLUMN).strip() or NOTION_DEFAULT_COLUMN
+    cols = notion_list_columns(db_id, token, tr)
+    if cols:
+        print()
+        print(" 이 DB 에서 기록할 '참가자 열'을 번호로 고르세요:")
+        for i, name in enumerate(cols, 1):
+            print(f"   {i}) {name}")
+        default_idx = cols.index(column) + 1 if column in cols else 1
+        while True:
+            try:
+                raw = input(f" 번호 (그냥 Enter = {default_idx}번 {cols[default_idx - 1]}): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                raw = ""
+            if raw == "":
+                column = cols[default_idx - 1]
+                break
+            if raw.isdigit() and 1 <= int(raw) <= len(cols):
+                column = cols[int(raw) - 1]
+                break
+            print("  목록에 있는 번호를 입력해 주세요.")
+    else:
+        try:
+            raw = input(f" 참가자 열 이름 (그냥 Enter = {column}): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            raw = ""
+        column = raw or column
+
+    cfg = {"enabled": True, "token": token, "db_id": db_id, "column": column}
+    p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    try:
+        os.chmod(p, 0o600)   # 이 파일에는 토큰이 들어 있다
+    except Exception:
+        pass
+    print()
+    print(f"[완료] {p.resolve()} 에 저장했습니다. (기록할 열: {column})")
+    print("       열을 바꾸고 싶으면 이 파일을 메모장으로 열어 column 값만 고치면 됩니다.")
+    print("       (토큰이 든 파일이라 .gitignore 에 등록되어 커밋되지 않습니다.)")
+    return load_notion_config(str(p))
+
+
+def ask_run_mode() -> tuple[str, int]:
+    """대화형 실행: 모드(1=노션 미체크만 / 2=최근·인기순)와 개수를 물어본다."""
+    print()
+    print("실행 모드를 골라 주세요.")
+    print("  1) 노션에 내 체크가 안 된 것만 신청  (노션 DB 를 먼저 읽어 이미 체크된 건 제외)")
+    print("  2) 최근·인기순에서 몇 개 신청        (기존 방식)")
+    mode = ""
+    while mode not in ("1", "2"):
+        try:
+            raw = input("번호 [1/2] (그냥 Enter = 2): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "list", LIMIT_DEFAULT
+        if raw == "":
+            mode = "2"
+        elif raw in ("1", "2"):
+            mode = raw
+        else:
+            print("  1 또는 2 중에서 골라 주세요.")
+    if mode == "1":
+        return "notion", ask_limit(LIMIT_DEFAULT_UNCHECKED,
+                                   f"몇 개 신청할까요? (그냥 Enter 시 최대 {LIMIT_DEFAULT_UNCHECKED}개): ")
+    return "list", ask_limit(LIMIT_DEFAULT)
 
 
 # ---------------------------------------------------------------------------
@@ -975,8 +1435,13 @@ def _dump_failure(page, cid: str, tag: str = "fail"):
         return None
 
 
-def apply_one(page, campaign: dict, skip_wishlist: bool = False) -> dict:
-    """캠페인 1건 신청. 결과 dict 반환(status: 성공/스킵/실패/불확실)."""
+def apply_one(page, campaign: dict, skip_wishlist: bool = False,
+              pre_submit_delay: tuple[float, float] = (0.0, 0.0)) -> dict:
+    """캠페인 1건 신청. 결과 dict 반환(status: 성공/스킵/실패/불확실).
+
+    pre_submit_delay: [신청 완료하기]를 누르기 **직전**에 기다릴 (최소, 최대) 초.
+    사람이 신청서를 확인하고 누르는 것처럼 보이게 하고, 연속 클릭 신호를 줄인다.
+    """
     cid = campaign.get("campaignId") or ""
     result = {
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -986,6 +1451,9 @@ def apply_one(page, campaign: dict, skip_wishlist: bool = False) -> dict:
         "category": category_label(campaign),
         "applicationCount": campaign.get("applicationCount") or 0,
         "recruitmentCount": campaign.get("recruitmentCount") or 0,
+        "remainingDays": campaign.get("remainingDays"),
+        "option": "",
+        "skip_wishlist": bool(skip_wishlist),
         "status": "실패",
         "reason": "",
     }
@@ -1029,6 +1497,7 @@ def apply_one(page, campaign: dict, skip_wishlist: bool = False) -> dict:
 
         # 2) 신청 페이지: 옵션이 있는 캠페인은 optionId 를 query 로 넘겨야 신청이 성립한다.
         url, opt_name = apply_url(cid, detail)
+        result["option"] = opt_name or ""
         page.goto(url, wait_until="domcontentloaded")
         page.wait_for_timeout(int(random.uniform(1200, 2000)))
 
@@ -1059,6 +1528,13 @@ def apply_one(page, campaign: dict, skip_wishlist: bool = False) -> dict:
         option_note = f"옵션:{opt_name[:18]}" if opt_name else "옵션 없음"
         if detail is None:
             option_note += f"(상세 조회 실패: {detail_err or '알 수 없음'})"
+
+        # 최종 제출 직전 잠깐 대기 (신청 후가 아니라 누르기 전에 쉬어 간다)
+        dmin, dmax = pre_submit_delay or (0.0, 0.0)
+        if dmax > 0:
+            wait_s = random.uniform(dmin, dmax)
+            print(f"[제출 전 {wait_s:.1f}s 대기] ", end="", flush=True)
+            time.sleep(wait_s)
 
         clicked = _click_first(page, [
             r"신청\s*완료하기", r"체험단\s*신청하기", r"신청\s*완료", r"신청하기", r"^신청$",
@@ -1160,10 +1636,22 @@ def run_apply(candidates: list, args) -> int:
         return 0
 
     targets = candidates[: args.limit]
+    notion_cfg = getattr(args, "notion_cfg", None)
     print(f"\n[신청 시작] 후보 {len(candidates)}개 중 상위 {len(targets)}개 "
           f"(정렬: {'마감임박' if args.sort == 'deadline' else '인기순'})")
+    notion_index = getattr(args, "notion_index", None)
+    if notion_cfg:
+        print(f"            노션 기록 사용: 열 '{notion_cfg['column']}' ({notion_cfg['file']})")
+        if notion_index is None:
+            notion_index = notion_scan(notion_cfg)
+            if notion_index is None:
+                print("            (노션 DB 를 미리 읽지 못했습니다 — 건별 쿼리로만 중복을 확인합니다)")
+            else:
+                print(f"            기존 행 {len(notion_index)}건 확인")
+        args.notion_index = notion_index
 
     results = []
+    notion_ok = notion_fail = 0
     with sync_playwright() as p:
         ctx = _launch(p, headless=args.headless, mode="mobile")
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
@@ -1189,16 +1677,26 @@ def run_apply(candidates: list, args) -> int:
             title = (item.get("campaignTitle") or "")[:36]
             print(f"\n({idx}/{len(targets)}) {title} … ", end="", flush=True)
             try:
-                res = apply_one(page, item, skip_wishlist=args.skip_wishlist)
+                res = apply_one(page, item, skip_wishlist=args.skip_wishlist,
+                               pre_submit_delay=(args.delay_min, args.delay_max))
             except LoginRequired:
                 print("로그인 필요 → 중단")
                 print("[중단] 로그인이 풀렸습니다. run_login.bat(데스크톱 로그인 창)으로 다시 로그인한 뒤 재실행하세요.")
                 break
             results.append(res)
             print(f"{res['status']} ({res['reason'][:80]})")
+            # 노션 기록: 성공 건만, 건별 즉시. 노션 오류가 나도 신청 루프는 계속된다.
+            if res.get("status") == "성공" and notion_cfg:
+                rec = notion_record(notion_cfg, res, index=notion_index)
+                if rec["status"] == "failed":
+                    notion_fail += 1
+                    print(f"    └ 노션 기록 실패: {rec['detail']}")
+                else:
+                    notion_ok += 1
+                    print(f"    └ 노션 기록: {rec['detail']} (열: {notion_cfg['column']})")
             if idx < len(targets):
-                delay = random.uniform(args.delay_min, args.delay_max)
-                time.sleep(delay)
+                # 다음 상품 이동은 짧게만(긴 대기는 신청 버튼 직전에 이미 했다)
+                time.sleep(random.uniform(GAP_MIN, GAP_MAX))
 
         ctx.close()
 
@@ -1207,6 +1705,8 @@ def run_apply(candidates: list, args) -> int:
     fail = sum(1 for r in results if r["status"] in ("실패", "불확실"))
     print("\n" + "=" * 60)
     print(f"결과 요약: 성공 {ok}건 / 스킵 {skip}건 / 실패·불확실 {fail}건")
+    if notion_cfg:
+        print(f"노션 기록: {notion_ok}건 성공 / {notion_fail}건 실패 (참가자 열: {notion_cfg['column']})")
     if any("고객센터로 문의" in (r.get("reason") or "") for r in results):
         print("\n[안내] '체험단에 응모하지 못했어요 / 고객센터로 문의' 팝업이 뜬 건이 있습니다.")
         print("       이 문구는 신청 POST 가 서버에서 거부됐는데 표준 에러 응답이 아닐 때 뜼니다.")
@@ -1234,21 +1734,48 @@ def main(argv=None) -> int:
     ap.add_argument("--login-mobile", action="store_true",
                     help="--login 과 함께: 모바일(iPhone) 화면에서 로그인 (데스크톱 로그인으로 세션이 안 잡힐 때)")
     ap.add_argument("--dry-run", action="store_true", help="실제 신청 없이 후보 목록만 출력")
-    ap.add_argument("--limit", type=int, default=30, help="실제 신청할 최대 개수 (기본 30)")
+    ap.add_argument("--limit", type=int, default=None,
+                    help=f"실제 신청할 최대 개수 (미지정 시 실행하면서 물어봄, Enter 시 기본 {LIMIT_DEFAULT})")
     ap.add_argument("--sort", choices=["popular", "deadline"], default="popular",
                     help="정렬 방식: popular(신청자 많은 순, 기본) / deadline(마감 임박 순)")
     ap.add_argument("--max-pages", type=int, default=30, help="목록 API 최대 페이지 수 (기본 30)")
-    ap.add_argument("--delay-min", type=float, default=5.0, help="건별 최소 대기 초 (기본 5.0)")
-    ap.add_argument("--delay-max", type=float, default=7.0, help="건별 최대 대기 초 (기본 7.0)")
+    ap.add_argument("--delay-min", type=float, default=5.0,
+                    help="[신청 완료하기] 클릭 직전 최소 대기 초 (기본 5.0)")
+    ap.add_argument("--delay-max", type=float, default=7.0,
+                    help="[신청 완료하기] 클릭 직전 최대 대기 초 (기본 7.0)")
     ap.add_argument("--headless", action="store_true", help="브라우저 창 없이 실행(디버깅 어려움)")
     ap.add_argument("--skip-wishlist", action="store_true",
                     help="위시(선물함)에 담는 단계를 건너뜀")
     ap.add_argument("--include-unknown", action="store_true",
                     help="카테고리 정보가 없는 상품까지 신청 대상에 포함(기본은 보류)")
+    ap.add_argument("--notion-pending", "--only-notion-unchecked", dest="notion_pending",
+                    action="store_true",
+                    help="노션에 내 열 체크가 없는 상품만 신청 (미체크 우선, 이미 체크된 건 제외)")
+    ap.add_argument("--notion-column", dest="notion_column", default=None,
+                    help=f"노션 참가자 열 이름 (기본: notion_secret.json 의 column, 없으면 '{NOTION_DEFAULT_COLUMN}')")
+    ap.add_argument("--setup-notion", dest="setup_notion", action="store_true",
+                    help="노션 연동 설정(notion_secret.json)을 대화형으로 만들고 종료")
+    ap.add_argument("--no-notion", dest="no_notion", action="store_true",
+                    help="노션 기록을 끄고 CSV 만 저장")
     args = ap.parse_args(argv)
+
+    if args.setup_notion:
+        return 0 if setup_notion() else 1
 
     if args.delay_min > args.delay_max:
         args.delay_min, args.delay_max = args.delay_max, args.delay_min
+
+    # ── 실행 모드/개수: 인자를 주면 그대로, 안 주면 대화형으로 물어본다(배치·자동화는 인자로).
+    interactive = (not (args.login or args.login_mobile or args.dry_run)) and sys.stdin.isatty()
+    mode = "notion" if args.notion_pending else "list"
+    if args.limit is None:
+        if interactive:
+            mode, args.limit = ask_run_mode()
+        else:
+            args.limit = LIMIT_DEFAULT_UNCHECKED if mode == "notion" else LIMIT_DEFAULT
+    if args.limit <= 0:
+        print("[안내] 1개 이상 입력해 주세요.")
+        return 1
 
     if args.login or args.login_mobile:
         try:
@@ -1264,6 +1791,26 @@ def main(argv=None) -> int:
                 print(f"[오류] 로그인 실행 실패: {type(exc).__name__}: {exc}")
             return 1
 
+    # ── 노션 설정: 없으면(대화형) 지금 만들지 물어본다. --no-notion 이면 아예 쓰지 않는다.
+    notion_cfg = None
+    if not args.no_notion:
+        notion_cfg = load_notion_config(column=args.notion_column)
+        if notion_cfg is None and interactive:
+            if ask_yes("노션 연동 설정 파일(notion_secret.json)이 없습니다.\n"
+                       "지금 입력해 저장할까요? (건너뛰려면 Enter)"):
+                notion_cfg = setup_notion()
+            else:
+                p = Path(NOTION_SECRET_FILE)
+                if not p.is_file():
+                    try:
+                        p.write_text(json.dumps(
+                            {"enabled": False, "_단계": "노션 기록을 쓰지 않음. 쓰려면 --setup-notion 으로 다시 설정"},
+                            ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                    except Exception:
+                        pass
+                print("[안내] 노션 기록 없이 진행합니다. (나중에 쓰려면 python main.py --setup-notion)")
+    args.notion_cfg = notion_cfg
+
     flt = load_filter()
     items = collect_campaigns(args.max_pages)
     if not items:
@@ -1274,6 +1821,26 @@ def main(argv=None) -> int:
     candidates, held, denied = build_candidates(
         items, flt, args.sort, applied, include_unknown=args.include_unknown
     )
+
+
+    # ── 1번 모드: 노션에 내 열 체크가 없는 상품만(미체크 우선) 신청한다.
+    if mode == "notion":
+        if not notion_cfg:
+            print("[중단] 1번 모드(노션 미체크만)는 노션 설정이 필요합니다.")
+            print("       배치로 실행하려면: python main.py --setup-notion")
+            return 1
+        scan = notion_scan(notion_cfg)
+        if scan is None:
+            print("[중단] 노션 DB 를 읽지 못해 미체크 목록을 확인할 수 없습니다.")
+            print("       (중복 신청을 막기 위해 이번 실행은 진행하지 않습니다.)")
+            return 1
+        args.notion_index = scan
+        candidates, nstat = order_by_notion(candidates, scan)
+        print(f"[노션] DB {len(scan)}행 · 내 열({notion_cfg['column']}) 체크 완료 {nstat['checked']}건 제외"
+              f" → 미체크 {nstat['pending']}건 + 신규 {nstat['fresh']}건 = 대상 {len(candidates)}건")
+        if not candidates:
+            print("미체크 상품이 없습니다. (오늘 진행 중 목록 기준)")
+            return 0
 
     if args.dry_run:
         print()
