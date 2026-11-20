@@ -18,6 +18,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -375,9 +376,10 @@ def start_login() -> dict:
     def run():
         add_line("[로그인] 데스크톱 로그인 창을 엽니다. 창에서 카카오 로그인을 끝까지 마쳐 주세요.")
         try:
+            env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
             p = subprocess.Popen([sys.executable or "python", script, "--login"], cwd=str(ROOT),
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                 encoding="utf-8", errors="replace", bufsize=1)
+                                 encoding="utf-8", errors="replace", bufsize=1, env=env)
         except Exception as exc:
             add_line(f"[로그인] 창을 열지 못했습니다: {type(exc).__name__}: {str(exc)[:120]}")
             return
