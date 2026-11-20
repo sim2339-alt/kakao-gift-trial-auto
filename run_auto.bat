@@ -14,8 +14,8 @@ if "%PY%"=="" (
 echo ============================================================
 echo  카카오 체험단 자동 신청
 echo ============================================================
-echo   1) 노션 DB 미체크 행만 신청  ^(노션에 없는 신규 상품은 제외^)
-echo   2) 최근·인기순에서 몇 개 신청       ^(기본 30개^)
+echo   1) 노션 미체크 목록만 불러오기  ^(신청 안 한 것만^)
+echo   2) 카카오 전체 중 신청 안 한 것  ^(인기순/마감임박순, 기본 100개^)
 echo   3) 노션 연동 설정 만들기 ^(notion_secret.json^)
 echo   4) 웹 조종판 열기  ^(브라우저에서 버튼으로 조작^)
 echo.
@@ -35,16 +35,18 @@ exit /b 1
 echo.
 echo ※ 처음 한 번은 노션 설정이 필요합니다. 없으면 지금 물어봅니다.
 set LIMIT=
-set /p LIMIT=몇 개 신청할까요? (그냥 Enter 시 최대 50개): 
-if "%LIMIT%"=="" set LIMIT=50
+set /p LIMIT=몇 개 신청할까요? (그냥 Enter = 100개, 0 = 있는 것 전부): 
+if "%LIMIT%"=="" set LIMIT=100
+if "%LIMIT%"=="전체" set LIMIT=0
 echo.
 %PY% main.py --notion-pending --limit %LIMIT%
 goto DONE
 
 :MODE2
 set LIMIT=
-set /p LIMIT=몇 개 신청할까요? (그냥 Enter 시 기본 30개): 
-if "%LIMIT%"=="" set LIMIT=30
+set /p LIMIT=몇 개 신청할까요? (그냥 Enter = 100개, 0 = 있는 것 전부): 
+if "%LIMIT%"=="" set LIMIT=100
+if "%LIMIT%"=="전체" set LIMIT=0
 echo.
 %PY% main.py --limit %LIMIT%
 goto DONE

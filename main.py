@@ -5,7 +5,8 @@
 사용법
   python main.py --login            최초 1회: 브라우저에서 카카오 로그인 후 세션 저장
   python main.py --dry-run          실제 신청 없이 오늘 후보 목록만 확인
-  python main.py --limit 30         후보 상위 30개 실제 신청 (기본값 30)
+  python main.py --limit 100        후보 상위 100개 실제 신청 (기본값 100)
+  python main.py --limit 0          지금 신청 가능한 후보 전체 신청 (0 = 제한 없음)
 
 주의
   - 본인 계정으로만 사용하세요. 계정 공유·대량 자동화는 이용약관 위반이 될 수 있습니다.
@@ -100,8 +101,9 @@ NOTION_TEXT_MAX = 2000
 NOTION_META_COLUMNS = ("단계", "옵션", "메커니즘", "마감일·모집현황")
 
 # 신청 개수 기본값 (대화형 실행에서 Enter 만 눌렀을 때)
-LIMIT_DEFAULT = 30
-LIMIT_DEFAULT_UNCHECKED = 50   # 노션 미체크 모드(1번) 기본값
+LIMIT_DEFAULT = 100
+LIMIT_DEFAULT_UNCHECKED = 100   # 노션 미체크 모드(1번) 기본값
+# 개수 0(또는 'all'/'전체')은 '제한 없음 = 후보 전부'를 뜻한다.
 # 신청 1건을 마친 뒤 다음 상품으로 넘어가기 전 대기(짧게). 긴 대기는 [신청 완료하기] 직전에 한다.
 GAP_MIN, GAP_MAX = 0.5, 1.0
 
@@ -421,7 +423,7 @@ def print_table(items: list, limit: int, header: str | None = None):
     if not items:
         print("후보가 없습니다.")
         return
-    rows = items[:limit]
+    rows = items[:limit] if limit and limit > 0 else items   # 0 = 제한 없음(전부)
     line = "-" * 96
     if header:
         print(header)
@@ -451,7 +453,7 @@ def save_candidates_csv(items: list, limit: int, held: list | None = None) -> Pa
         wr.writerow(["순위", "상태", "campaignId", "상품명", "브랜드", "카테고리",
                      "신청자수", "모집인원", "남은일수", "상세URL"])
         rank = 0
-        for item in items[:limit]:
+        for item in (items[:limit] if limit and limit > 0 else items):
             rank += 1
             wr.writerow([
                 rank,
@@ -848,20 +850,39 @@ def select_notion_targets(rows: list, live_items: list, applied: set | None = No
     return picked, held, stat
 
 
+def parse_limit(raw: str, default: int = LIMIT_DEFAULT) -> int | None:
+    """개수 입력 문자열을 숫자로 바꿔 본다. 0/'all'/'전체' = 제한 없음(0). 잘못된 값은 None."""
+    text = (raw or "").strip()
+    if text == "":
+        return default
+    if text.lower() in ("all", "전체", "전부", "모두"):
+        return 0
+    if text.isdigit():
+        return int(text)          # 0 이면 그대로 0(전체)
+    return None
+
+
 def ask_limit(default: int = LIMIT_DEFAULT, prompt: str | None = None) -> int:
-    """신청 개수를 물어본다(Enter = 기본값, 숫자만 허용)."""
-    prompt = prompt or f"몇 개 신청할까요? (그냥 Enter 시 기본 {default}개): "
+    """신청 개수를 물어본다(Enter = 기본값, 0·'전체' = 제한 없이 전부)."""
+    prompt = prompt or (f"몇 개 신청할까요? (그냥 Enter = {default}개, 0 또는 '전체' = 있는 것 전부): ")
     while True:
         try:
             raw = input(prompt).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return default
-        if raw == "":
-            return default
-        if raw.isdigit() and int(raw) > 0:
-            return int(raw)
-        print("  숫자만 입력해 주세요. (예: 30)")
+        value = parse_limit(raw, default)
+        if value is not None:
+            return value
+        print("  숫자로 입력해 주세요. (예: 100 / 0 = 전체)")
+
+
+def _limit_arg(text: str) -> int:
+    """--limit 인자 해석: 숫자 또는 'all'/'전체'(= 0, 제한 없음)."""
+    value = parse_limit(str(text), LIMIT_DEFAULT)
+    if value is None:
+        raise argparse.ArgumentTypeError("개수는 숫자(0 = 전체) 또는 'all'/'전체' 로 주세요.")
+    return value
 
 
 def ask_yes(prompt: str) -> bool:
@@ -986,11 +1007,11 @@ def setup_notion(path: str | None = None, transport=None) -> dict | None:
 
 
 def ask_run_mode() -> tuple[str, int]:
-    """대화형 실행: 모드(1=노션 미체크만 / 2=최근·인기순)와 개수를 물어본다."""
+    """대화형 실행: 모드(1=노션 미체크만 / 2=카카오 전체 중 신청 안 한 것)와 개수를 물어본다."""
     print()
     print("실행 모드를 골라 주세요.")
-    print("  1) 노션 DB 의 미체크 행만 신청  (노션에 없는 신규 상품은 제외)")
-    print("  2) 최근·인기순에서 몇 개 신청        (기존 방식)")
+    print("  1) 노션 미체크 목록만 불러오기 (신청 안 한 것만)")
+    print("  2) 카카오 전체 중 신청 안 한 것 (인기순/마감임박순)")
     mode = ""
     while mode not in ("1", "2"):
         try:
@@ -1006,7 +1027,7 @@ def ask_run_mode() -> tuple[str, int]:
             print("  1 또는 2 중에서 골라 주세요.")
     if mode == "1":
         return "notion", ask_limit(LIMIT_DEFAULT_UNCHECKED,
-                                   f"몇 개 신청할까요? (그냥 Enter 시 최대 {LIMIT_DEFAULT_UNCHECKED}개): ")
+                                   f"몇 개 신청할까요? (그냥 Enter = {LIMIT_DEFAULT_UNCHECKED}개, 0 또는 '전체' = 전부): ")
     return "list", ask_limit(LIMIT_DEFAULT)
 
 
@@ -1754,9 +1775,10 @@ def run_apply(candidates: list, args) -> int:
         print("신청할 후보가 없습니다.")
         return 0
 
-    targets = candidates[: args.limit]
+    targets = candidates[: args.limit] if args.limit and args.limit > 0 else list(candidates)
     notion_cfg = getattr(args, "notion_cfg", None)
-    print(f"\n[신청 시작] 후보 {len(candidates)}개 중 상위 {len(targets)}개 "
+    scope = f"상위 {len(targets)}개" if args.limit and args.limit > 0 else f"전체 {len(targets)}개(제한 없음)"
+    print(f"\n[신청 시작] 후보 {len(candidates)}개 중 {scope} "
           f"(정렬: {'마감임박' if args.sort == 'deadline' else '인기순'})")
     notion_index = getattr(args, "notion_index", None)
     if notion_cfg:
@@ -1856,8 +1878,9 @@ def main(argv=None) -> int:
     ap.add_argument("--login-mobile", action="store_true",
                     help="--login 과 함께: 모바일(iPhone) 화면에서 로그인 (데스크톱 로그인으로 세션이 안 잡힐 때)")
     ap.add_argument("--dry-run", action="store_true", help="실제 신청 없이 후보 목록만 출력")
-    ap.add_argument("--limit", type=int, default=None,
-                    help=f"실제 신청할 최대 개수 (미지정 시 실행하면서 물어봄, Enter 시 기본 {LIMIT_DEFAULT})")
+    ap.add_argument("--limit", type=_limit_arg, default=None,
+                    help=f"실제 신청할 최대 개수 — 0 또는 all/전체 = 제한 없이 전부 "
+                         f"(미지정 시 실행하면서 물어봄, Enter 시 기본 {LIMIT_DEFAULT})")
     ap.add_argument("--sort", choices=["popular", "deadline"], default="popular",
                     help="정렬 방식: popular(신청자 많은 순, 기본) / deadline(마감 임박 순)")
     ap.add_argument("--max-pages", type=int, default=30, help="목록 API 최대 페이지 수 (기본 30)")
@@ -1897,14 +1920,15 @@ def main(argv=None) -> int:
         if interactive and mode == "notion":
             # --notion-pending 을 이미 줬으면 모드는 다시 묻지 않고 개수만 묻는다.
             args.limit = ask_limit(LIMIT_DEFAULT_UNCHECKED,
-                                   f"몇 개 신청할까요? (그냥 Enter 시 최대 {LIMIT_DEFAULT_UNCHECKED}개): ")
+                                   f"몇 개 신청할까요? (그냥 Enter = {LIMIT_DEFAULT_UNCHECKED}개, 0 또는 '전체' = 전부): ")
         elif interactive:
             mode, args.limit = ask_run_mode()
         else:
             args.limit = LIMIT_DEFAULT_UNCHECKED if mode == "notion" else LIMIT_DEFAULT
-    if args.limit <= 0:
-        print("[안내] 1개 이상 입력해 주세요.")
-        return 1
+    if args.limit < 0:
+        args.limit = 0
+    if args.limit == 0:
+        print("[안내] 신청 개수 0 → 제한 없이 대상 전체를 신청합니다.")
 
     if args.login or args.login_mobile:
         try:
@@ -2003,7 +2027,7 @@ def main(argv=None) -> int:
             path = save_candidates_csv(candidates, args.limit, held)
             print(f"후보 목록 저장: {path.resolve()}")
         print("\n※ dry-run 모드입니다. 실제 신청은 하나도 하지 않았습니다.")
-        print("※ 실제 신청: run_auto.bat (또는 python main.py --limit 30)")
+        print("※ 실제 신청: run_auto.bat (또는 python main.py --limit 100 / --limit 0 = 전체)")
         return 0
 
     if held and not args.include_unknown:

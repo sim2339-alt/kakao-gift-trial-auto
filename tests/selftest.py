@@ -16,6 +16,8 @@ import json
 import os
 import re
 import sys
+import contextlib
+import io
 import threading
 import time
 import urllib.request
@@ -808,11 +810,21 @@ def test_notion():
     path.unlink(missing_ok=True)
     tmp.unlink(missing_ok=True)
 
-    # 11) 개수 입력: Enter = 기본, 숫자만 인정
+    # 11) 개수 입력: Enter = 기본(100), 숫자·0·'전체' 인정
+    check("기본값: LIMIT_DEFAULT = 100", main.LIMIT_DEFAULT == 100, str(main.LIMIT_DEFAULT))
+    check("기본값: 노션 미체크 기본도 100", main.LIMIT_DEFAULT_UNCHECKED == 100,
+          str(main.LIMIT_DEFAULT_UNCHECKED))
     with use_input(["", "10", "abc", "7"]) as fake:
-        check("입력: Enter → 기본 30", main.ask_limit() == 30)
+        check("입력: Enter → 기본 100", main.ask_limit() == 100)
         check("입력: 숫자 → 그 값", main.ask_limit() == 10)
         check("입력: 문자는 다시 묻는다", main.ask_limit() == 7, str(fake.prompts[-1:]))
+    with use_input(["0", "전체", "all", " 0 "]):
+        check("입력: 0 → 전체(0)", main.ask_limit() == 0)
+        check("입력: '전체' → 전체(0)", main.ask_limit() == 0)
+        check("입력: 'all' → 전체(0)", main.ask_limit() == 0)
+        check("입력: 공백+'0' → 전체(0)", main.ask_limit(50) == 0)
+    with use_input(["200"]):
+        check("입력: 200개 지원", main.ask_limit() == 200)
     with use_input([]):
         check("입력: EOF → 기본값", main.ask_limit(50) == 50)
 
@@ -921,10 +933,26 @@ def test_main_modes():
         rc = main.main(["--notion-pending", "--limit", "5"])
         check("모드1: 노션 설정 없으면 중단", rc == 1, f"rc={rc}")
 
-        # (7) --limit 0 은 거부
+        # (7) --limit 0 = 제한 없이 대상 전체
         sys.stdin = FakeStdin(False)
-        rc = main.main(["--limit", "0"])
-        check("--limit 0 → 중단", rc == 1, f"rc={rc}")
+        with use_input([]) as fake:
+            rc = main.main(["--limit", "0"])
+        got0 = seen[-1]
+        check("--limit 0 → 전체(제한 없음)로 실행", rc == 0 and got0["limit"] == 0 and fake.prompts == [],
+              f"rc={rc} {got0}")
+        check("--limit 0 → 대상 전부가 run_apply 로 전달", got0["count"] == len(got0["ids"]) and got0["count"] >= 2,
+              str(got0))
+        check("--limit 0 → 제외 카테고리는 여전히 빠짐", "id-무드웨어 블" not in got0["ids"], str(got0["ids"]))
+
+        # (8) 개수 0 = 화면 표시·CSV 도 후보 전부
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            main.print_table(items, 0)
+        check("표시: limit 0 → 후보 전체 출력", f"표시 {len(items)}개" in buf.getvalue(), buf.getvalue()[-90:])
+        csv_path = main.save_candidates_csv(items, 0)
+        csv_lines = csv_path.read_text(encoding="utf-8-sig").strip().splitlines()
+        check("CSV: limit 0 → 후보 전체 저장", len(csv_lines) - 1 == len(items), str(len(csv_lines)))
+        csv_path.unlink(missing_ok=True)
     finally:
         main.collect_campaigns = saved["collect_campaigns"]
         main.collect_applied_ids = saved["collect_applied_ids"]
@@ -998,6 +1026,14 @@ def test_web():
         check("웹: 미리보기 요약 문구 포함", "노션 DB" in pv["summary"] and "244" not in pv["summary"], pv["summary"])
         pv2 = web_ui.preview("list", 2)
         check("웹: 2번 모드 미리보기", pv2["ok"] and len(pv2["items"]) == 2, str(pv2.get("summary")))
+        pv_all = web_ui.preview("list", 0)
+        check("웹: 미리보기 limit 0 = 대상 전부", pv_all["ok"] and pv_all["limit"] == 0
+              and len(pv_all["items"]) == pv_all["total"], f"{pv_all.get('total')} / {len(pv_all.get('items') or [])}")
+        pv_all2 = web_ui.preview("list", "전체")
+        check("웹: 미리보기 '전체' 문자열도 전부", pv_all2["ok"] and pv_all2["limit"] == 0
+              and len(pv_all2["items"]) == pv_all2["total"], str(pv_all2.get("limit")))
+        pv_def = web_ui.preview("list")
+        check("웹: 미리보기 개수 생략 = 기본 100", pv_def["ok"] and pv_def["limit"] == 100, str(pv_def.get("limit")))
         pv3 = web_ui.preview("notion", 5, notion_all=True)
         check("웹: 제외 카테고리까지 포함 옵션", sorted(i["campaignId"] for i in pv3["items"]) == ["n1", "n2"],
               str([i["campaignId"] for i in pv3["items"]]))
@@ -1026,6 +1062,21 @@ def test_web():
               argv == ["--limit", "3", "--sort", "deadline", "--skip-wishlist",
                        "--delay-min", "4.0", "--delay-max", "6.0"], str(argv))
         check("웹: --notion-all 인자", "--notion-all" in web_ui.build_argv({"mode": "notion", "notion_all": True}))
+        check("웹: limit 0 인자", web_ui.build_argv({"mode": "list", "limit": 0}) == ["--limit", "0"],
+              str(web_ui.build_argv({"mode": "list", "limit": 0})))
+        check("웹: '전체' 인자도 0", web_ui.build_argv({"mode": "list", "limit": "전체"}) == ["--limit", "0"],
+              str(web_ui.build_argv({"mode": "list", "limit": "전체"})))
+        check("웹: 개수 미지정 인자 = 기본 100", web_ui.build_argv({"mode": "list"}) == ["--limit", "100"],
+              str(web_ui.build_argv({"mode": "list"})))
+        check("CLI: --limit all → 0(전체)", main._limit_arg("all") == 0 and main._limit_arg("전체") == 0,
+              str((main._limit_arg("all"), main._limit_arg("전체"))))
+        check("CLI: --limit 200 → 200", main._limit_arg("200") == 200)
+        try:
+            main._limit_arg("많이")
+            bad_arg = True
+        except Exception:
+            bad_arg = False
+        check("CLI: --limit 잘못된 값은 거부", bad_arg is False)
 
         # 5) 실행 → 중단 → 요약(진짜 main 대신 가짜 함수)
         def fake_main(argv):
@@ -1064,6 +1115,11 @@ def test_web():
         try:
             html = urllib.request.urlopen(base + "/", timeout=10).read().decode("utf-8")
             check("웹: 첫 화면 HTML", "카카오 체험단" in html and "<script>" in html and "</html>" in html)
+            check("웹: 개수 칩 50·100·200·전체", all(f'data-limit="{v}"' in html for v in ("50", "100", "200", "0"))
+                  and ">전체<" in html, "")
+            check("웹: 개수 기본 100 · 0=전체 안내", 'id="limit" value="100" min="0"' in html and "0 = 있는 것 전부" in html, "")
+            check("웹: 모드 라벨 정리", "노션 미체크 목록 (신청 안 한 것만)" in html
+                  and "카카오 전체 중 신청 안 한 것" in html and "인기순 N개" not in html, "")
             st2 = json.loads(urllib.request.urlopen(base + "/api/status", timeout=15).read().decode("utf-8"))
             check("웹: /api/status 200", st2.get("version") == web_ui.APP_VERSION, str(st2)[:120])
             check("웹: /api/status 토큰 미노출", "ntn_" not in json.dumps(st2, ensure_ascii=False))
@@ -1073,6 +1129,13 @@ def test_web():
             pv4 = json.loads(urllib.request.urlopen(req, timeout=20).read().decode("utf-8"))
             check("웹: /api/preview 동작", pv4.get("ok") is True and len(pv4.get("items") or []) <= 3,
                   str(pv4)[:120])
+            req0 = urllib.request.Request(
+                base + "/api/preview", data=json.dumps({"mode": "list", "limit": 0}).encode("utf-8"),
+                headers={"Content-Type": "application/json"}, method="POST")
+            pv0 = json.loads(urllib.request.urlopen(req0, timeout=20).read().decode("utf-8"))
+            check("웹: /api/preview limit 0 = 전부", pv0.get("ok") is True and pv0.get("limit") == 0
+                  and len(pv0.get("items") or []) == pv0.get("total"),
+                  f"limit={pv0.get('limit')} items={len(pv0.get('items') or [])} total={pv0.get('total')}")
             try:
                 urllib.request.urlopen(base + "/api/nope", timeout=10)
                 missing = 200

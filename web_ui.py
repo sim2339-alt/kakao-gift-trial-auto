@@ -230,12 +230,35 @@ def plan_summary(mode: str, stat: dict, total: int, applied_checked: bool) -> st
             f"제외 {stat.get('denied', 0)}) → 신청 대상 {total}건")
 
 
-def preview(mode: str = "notion", limit: int = 30, column: str | None = None,
+def normalize_limit(limit, default: int | None = None) -> int:
+    """개수 값을 정리한다. 0/'all'/'전체' = 제한 없음(0), 빈 값 = 기본값."""
+    if default is None:
+        default = main.LIMIT_DEFAULT
+    if limit is None:
+        return default
+    if isinstance(limit, str):
+        text = limit.strip()
+        if text == "":
+            return default
+        if text.lower() in ("all", "전체", "전부", "모두"):
+            return 0
+        try:
+            limit = int(float(text))
+        except ValueError:
+            return default
+    try:
+        value = int(limit)
+    except (TypeError, ValueError):
+        return default
+    return 0 if value <= 0 else value
+
+
+def preview(mode: str = "notion", limit=main.LIMIT_DEFAULT, column: str | None = None,
             sort: str = "popular", include_unknown: bool = False,
             notion_all: bool = False, max_pages: int = 30) -> dict:
-    """후보만 읽어 온다(실제 신청 없음). 오류는 dict 로 돌려준다."""
+    """후보만 읽어 온다(실제 신청 없음). 오류는 dict 로 돌려준다. limit 0 = 전체."""
     mode = "notion" if mode == "notion" else "list"
-    limit = max(1, int(limit or 30))
+    limit = normalize_limit(limit, main.LIMIT_DEFAULT)
     notion_cfg = None
     if mode == "notion":
         notion_cfg = main.load_notion_config(column=column)
@@ -263,7 +286,7 @@ def preview(mode: str = "notion", limit: int = 30, column: str | None = None,
         "applied_checked": applied is not None,
         "summary": plan_summary(mode, stat, len(picked), applied is not None),
         "stat": stat,
-        "items": [main.candidate_row(i) for i in picked[:limit]],
+        "items": [main.candidate_row(i) for i in (picked[:limit] if limit > 0 else picked)],
         "held": [main.candidate_row(i) for i in held[:20]],
     }
 
@@ -278,7 +301,7 @@ def build_argv(payload: dict) -> list:
         argv.append("--notion-pending")
         if payload.get("notion_all"):
             argv.append("--notion-all")
-    argv += ["--limit", str(max(1, int(payload.get("limit") or 30)))]
+    argv += ["--limit", str(normalize_limit(payload.get("limit"), main.LIMIT_DEFAULT))]
     if payload.get("column"):
         argv += ["--notion-column", str(payload["column"]).strip()]
     if str(payload.get("sort") or "popular") == "deadline":
@@ -474,7 +497,7 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/api/preview":
             self._json(preview(mode=payload.get("mode") or "notion",
-                               limit=payload.get("limit") or 30,
+                               limit=payload.get("limit"),
                                column=payload.get("column") or None,
                                sort=payload.get("sort") or "popular",
                                include_unknown=bool(payload.get("include_unknown")),
@@ -572,6 +595,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .seg button{border:0;background:transparent;color:var(--muted);font:inherit;font-size:13.5px;
         padding:8px 14px;border-radius:8px;cursor:pointer}
   .seg button.on{background:var(--accent);color:var(--accent-ink);font-weight:700}
+  .seg.chips button{font-size:12.5px;padding:7px 11px}
   button.btn{font:inherit;font-size:14px;font-weight:600;border-radius:11px;padding:10px 16px;cursor:pointer;
         border:1px solid var(--line);background:var(--card);color:var(--text);transition:.15s}
   button.btn:hover:not(:disabled){border-color:var(--muted)}
@@ -635,12 +659,18 @@ PAGE_HTML = r"""<!DOCTYPE html>
     <h2>실행 설정</h2>
     <div class="row">
       <div class="seg" id="modeSeg">
-        <button data-mode="notion" class="on">노션 미체크 목록만</button>
-        <button data-mode="list">인기순 N개</button>
+        <button data-mode="notion" class="on">노션 미체크 목록 (신청 안 한 것만)</button>
+        <button data-mode="list">카카오 전체 중 신청 안 한 것 (인기순 등)</button>
       </div>
-      <label class="field">신청 개수
-        <input type="number" id="limit" value="30" min="1" max="500">
+      <label class="field">신청 개수 <span class="muted">(0 = 있는 것 전부)</span>
+        <input type="number" id="limit" value="100" min="0" max="9999">
       </label>
+      <div class="seg chips" id="limitChips">
+        <button data-limit="50">50개</button>
+        <button data-limit="100" class="on">100개</button>
+        <button data-limit="200">200개</button>
+        <button data-limit="0">전체</button>
+      </div>
       <label class="field">정렬
         <select id="sort">
           <option value="popular">인기순</option>
@@ -659,7 +689,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
       <label class="check"><input type="checkbox" id="unknown">카테고리 미확인도 포함</label>
       <label class="check" id="notionAllWrap"><input type="checkbox" id="notionAll">제외 카테고리까지 포함</label>
     </div>
-    <p class="hint">개수는 그때그때 바꾸면 됩니다. 실제 신청은 [자동 신청 시작]을 눌러야 시작됩니다.</p>
+    <p class="hint">개수는 그때그때 바꾸면 됩니다(0 또는 [전체] = 지금 대상 전부). 실제 신청은 [자동 신청 시작]을 눌러야 시작됩니다.</p>
   </section>
 
   <section class="card">
@@ -707,6 +737,20 @@ let logSince = 0;
 let busy = false;
 
 function esc(s){ return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+/* 개수 입력값: 빈칸 = 기본 100, 0 이하 = 전체(0) */
+function limitVal(){
+  const raw = String($("limit").value ?? "").trim();
+  if(raw === "") return 100;
+  const n = Number(raw);
+  if(!Number.isFinite(n)) return 100;
+  return n > 0 ? Math.floor(n) : 0;
+}
+
+function syncLimitChips(){
+  const v = limitVal();
+  [...$("limitChips").children].forEach(b => b.classList.toggle("on", Number(b.dataset.limit) === v));
+}
 
 async function api(path, body){
   const opt = body === undefined ? {} : {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)};
@@ -767,12 +811,14 @@ async function loadPreview(){
   $("previewState").textContent = "불러오는 중…";
   try{
     const r = await api("/api/preview", {
-      mode, limit: Number($("limit").value) || 30, column: $("column").value || null,
+      mode, limit: limitVal(), column: $("column").value || null,
       sort: $("sort").value, include_unknown: $("unknown").checked, notion_all: $("notionAll").checked
     });
     if(!r.ok){ $("previewState").textContent = "불러오지 못했습니다."; banner($("runBanner"), r.error, "err"); return; }
     banner($("runBanner"), "");
-    $("previewState").textContent = `대상 ${r.total}건 중 ${r.items.length}건 표시`;
+    $("previewState").textContent = limitVal() === 0
+      ? `대상 ${r.total}건 전체 표시`
+      : `대상 ${r.total}건 중 ${r.items.length}건 표시`;
     const sum = $("previewSummary");
     sum.style.display = "block";
     sum.innerHTML = esc(r.summary);
@@ -794,7 +840,7 @@ async function loadPreview(){
 /* ── 실행 ───────────────────────────────────────────── */
 async function startRun(){
   const r = await api("/api/start", {
-    mode, limit: Number($("limit").value) || 30, column: $("column").value || null,
+    mode, limit: limitVal(), column: $("column").value || null,
     sort: $("sort").value, include_unknown: $("unknown").checked, notion_all: $("notionAll").checked,
     skip_wishlist: !$("wish").checked,
     delay_min: Number($("delayMin").value || 5), delay_max: Number($("delayMax").value || 7)
@@ -846,6 +892,14 @@ $("modeSeg").addEventListener("click", (e) => {
   [...$("modeSeg").children].forEach(x => x.classList.toggle("on", x === b));
   $("notionAllWrap").style.display = mode === "notion" ? "flex" : "none";
 });
+$("limitChips").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-limit]");
+  if(!b) return;
+  $("limit").value = b.dataset.limit;
+  syncLimitChips();
+  $("previewSummary").style.display = "none";
+});
+$("limit").addEventListener("input", syncLimitChips);
 $("btnPreview").onclick = loadPreview;
 $("btnStart").onclick = startRun;
 $("btnStop").onclick = stopRun;
@@ -864,6 +918,7 @@ $("btnSaveColumn").onclick = async () => {
   refreshStatus();
 };
 $("notionAllWrap").style.display = "flex";
+syncLimitChips();
 
 refreshStatus();
 refreshLog();
