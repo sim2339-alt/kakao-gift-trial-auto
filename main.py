@@ -10,19 +10,24 @@
 주의
   - 본인 계정으로만 사용하세요. 계정 공유·대량 자동화는 이용약관 위반이 될 수 있습니다.
   - 로그인 정보(비밀번호)는 이 스크립트 어디에도 저장되지 않습니다.
-    로그인 세션은 ./kakao_profile 폴더(브라우저 프로필)에만 남습니다.
+    로그인 세션은 ./kakao_profile 폴더(브라우저 프로필)와 kakao_state.json(세션 백업)에만 남습니다.
+  - 로그인은 반드시 '데스크톱 웹 로그인' 경로로 합니다(아래 _login_url 설명 참고).
+    모바일 화면에서 로그인 버튼을 누르면 카카오톡 앱 안내로 빠져 PC에서는 로그인이 완결되지 않습니다.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import http.cookiejar
 import json
+import os
 import random
 import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +50,21 @@ MOBILE_UA = (
 DEVICE_CANDIDATES = ["iPhone 14", "iPhone 13", "iPhone 12"]
 PROFILE_DIR = "kakao_profile"
 LOG_DIR = Path("logs")
+
+# 로그인 전용(데스크톱) 설정 — 자세한 이유는 _login_url() 주석 참고
+DESKTOP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+DESKTOP_VIEWPORT = {"width": 1280, "height": 900}
+# 카카오 '웹 로그인(OAuth 코드)' 입구 — gift 세션 쿠키를 실제로 발급하는 유일한 경로
+AUTH_WEB = "https://shopping-userauth-web.kakao.com"
+GIFT_WEB_LOGIN = BASE + "/a/v1/web/login"
+LOGIN_TARGET = BASE + "/giftbox/trial-campaign"
+# 로그인 세션 백업(storage_state) — .gitignore 에 등록되어 있음
+STATE_FILE = "kakao_state.json"
+LOGIN_WAIT_SECONDS = 180
+LOGIN_POLL_SECONDS = 2
 
 # 목록 API 정렬은 CREATED_AT만 허용된다.
 # sortProperty=APPLY_COUNT 는 서버가 HTTP 400 을 돌려주므로, 인기순은 받아온 뒤 로컬에서 정렬한다.
@@ -94,7 +114,54 @@ def load_filter() -> dict:
 # ---------------------------------------------------------------------------
 # 2. HTTP (표준 라이브러리만 사용 → 설치 실패 요인 최소화)
 # ---------------------------------------------------------------------------
-def fetch_json(url: str, timeout: int = 20):
+_SESSION_OPENER = None  # 저장된 세션 쿠키를 붙인 요청기(1회만 생성)
+
+
+def _load_state_cookies(path: str = STATE_FILE) -> list:
+    """kakao_state.json(storage_state)에서 쿠키 목록만 꺼낸다. 값은 절대 출력하지 않는다."""
+    p = Path(path)
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    cookies = data.get("cookies") or []
+    return [c for c in cookies if c.get("name") and c.get("domain")]
+
+
+def _cookie_jar(cookies: list | None = None) -> http.cookiejar.CookieJar:
+    """storage_state 쿠키 → urllib 용 CookieJar (--dry-run 신청이력 조회에 사용)."""
+    jar = http.cookiejar.CookieJar()
+    for c in (_load_state_cookies() if cookies is None else cookies):
+        try:
+            expires = c.get("expires")
+            expires = int(expires) if expires and float(expires) > 0 else None
+            jar.set_cookie(http.cookiejar.Cookie(
+                version=0, name=c["name"], value=c.get("value", ""),
+                port=None, port_specified=False,
+                domain=c["domain"], domain_specified=True,
+                domain_initial_dot=str(c["domain"]).startswith("."),
+                path=c.get("path") or "/", path_specified=True,
+                secure=bool(c.get("secure")), expires=expires, discard=False,
+                comment=None, comment_url=None, rfc2109=False,
+                rest={"HttpOnly": None} if c.get("httpOnly") else {},
+            ))
+        except Exception:
+            continue
+    return jar
+
+
+def _session_opener():
+    global _SESSION_OPENER
+    if _SESSION_OPENER is None:
+        jar = _cookie_jar()
+        _SESSION_OPENER = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(jar)) if len(jar) else False
+    return _SESSION_OPENER or None
+
+
+def fetch_json(url: str, timeout: int = 20, use_session: bool = False):
     """(status, data, error) 반환. 로그인 관련 401 은 예외 대신 상태코드로 돌려준다."""
     req = urllib.request.Request(
         url,
@@ -104,7 +171,12 @@ def fetch_json(url: str, timeout: int = 20):
             "Referer": BASE + "/giftbox/trial-campaign",
         },
     )
+    opener = _session_opener() if use_session else None
     try:
+        if opener is not None:
+            with opener.open(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                return resp.status, json.loads(raw), None
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
             return resp.status, json.loads(raw), None
@@ -147,9 +219,10 @@ def collect_applied_ids() -> set | None:
     """이미 신청한 캠페인 ID 집합. 로그인 세션이 없으면 401 → None."""
     applied, page = set(), 0
     while page < 30:
-        status, data, err = fetch_json(f"{HISTORY_API}?page={page}&size=50")
+        status, data, err = fetch_json(f"{HISTORY_API}?page={page}&size=50", use_session=True)
         if status == 401:
-            print("[안내] 신청 이력 조회는 로그인이 필요합니다(세션 없음/만료).")
+            print("[안내] 신청 이력 조회는 로그인이 필요합니다(저장된 세션 없음/만료).")
+            print("       run_login.bat 을 한 번 실행하면 다음부터 신청 이력까지 자동으로 걸러집니다.")
             return None
         if status != 200 or not isinstance(data, dict):
             print(f"[경고] 신청 이력 조회 실패 (status={status}, {err})")
@@ -360,35 +433,6 @@ def _pick_device(p):
             "is_mobile": True, "has_touch": True, "device_scale_factor": 3}
 
 
-def _launch(p, headless: bool):
-    """모바일 에뮬레이션 + 영구 프로필(로그인 세션 유지)."""
-    from playwright.sync_api import sync_playwright  # noqa: F401  (문서화용)
-
-    device = dict(_pick_device(p))
-    device.pop("default_browser_type", None)
-    ctx = p.chromium.launch_persistent_context(
-        str(Path(PROFILE_DIR).resolve()),
-        headless=headless,
-        locale="ko-KR",
-        timezone_id="Asia/Seoul",
-        args=["--disable-blink-features=AutomationControlled"],
-        **device,
-    )
-    ctx.set_default_timeout(8000)
-    return ctx
-
-
-def _logged_in(ctx) -> bool:
-    try:
-        resp = ctx.request.get(
-            f"{HISTORY_API}?page=0&size=1",
-            headers={"User-Agent": MOBILE_UA, "Referer": BASE + "/giftbox/trial-campaign"},
-        )
-        return resp.status == 200
-    except Exception:
-        return False
-
-
 def _browser_hint(exc) -> str:
     """playwright 가 내는 불친절한 오류를 사용자용 문장으로 바꾼다."""
     msg = str(exc)
@@ -399,37 +443,290 @@ def _browser_hint(exc) -> str:
     return ""
 
 
-def run_login() -> int:
-    from playwright.sync_api import sync_playwright
+def _launch(p, headless: bool, mode: str = "mobile"):
+    """영구 프로필(kakao_profile)로 브라우저 실행.
 
-    with sync_playwright() as p:
-        ctx = _launch(p, headless=False)
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        page.goto(BASE + "/giftbox/trial-campaign", wait_until="domcontentloaded")
-        print()
-        print("=" * 64)
-        print(" 1) 열린 브라우저 창에서 [카카오 로그인]을 직접 진행해 주세요.")
-        print(" 2) 로그인이 끝나면 이 검은 창으로 돌아와 Enter 키를 누르세요.")
-        print("    (브라우저 창은 Enter를 누르면 자동으로 닫힙니다)")
-        print("=" * 64)
+    mode="mobile" : 체험단 신청용(iPhone 14 에뮬레이션). 데스크톱 UA 로 열면 /pc-restricted 로 막힌다.
+    mode="desktop": 로그인용. gift 의 로그인 분기가 모바일 UA 에서는 '카카오톡 앱으로 열기'로 빠지므로
+                    로그인만은 데스크톱 UA 로 진행한다(쿠키는 UA 와 무관하게 같은 프로필에 저장된다).
+    """
+    from playwright.sync_api import sync_playwright  # noqa: F401  (문서화용)
+
+    if mode == "desktop":
+        opts = {"user_agent": DESKTOP_UA, "viewport": dict(DESKTOP_VIEWPORT)}
+    else:
+        opts = dict(_pick_device(p))
+        opts.pop("default_browser_type", None)
+
+    ctx = p.chromium.launch_persistent_context(
+        str(Path(PROFILE_DIR).resolve()),
+        headless=headless,
+        locale="ko-KR",
+        timezone_id="Asia/Seoul",
+        args=["--disable-blink-features=AutomationControlled"],
+        **opts,
+    )
+    ctx.set_default_timeout(8000)
+    return ctx
+
+
+def _restore_state(ctx) -> int:
+    """kakao_state.json 이 있으면 쿠키를 프로필에 복원한다(프로필이 날아간 경우 대비)."""
+    cookies = _load_state_cookies()
+    if not cookies:
+        return 0
+    try:
+        ctx.add_cookies(cookies)
+        print(f"[세션] kakao_state.json 쿠키 {len(cookies)}개를 불러왔습니다.")
+        return len(cookies)
+    except Exception as exc:
+        print(f"[경고] kakao_state.json 쿠키 복원 실패: {type(exc).__name__}")
+        return 0
+
+
+def _ensure_session(ctx) -> bool:
+    """프로필 세션을 먼저 확인하고, 없을 때만 kakao_state.json 백업을 복원한다.
+
+    (새 프로필에 이미 있는 세션을 오래된 백업 쿠키로 덮어써 로그아웃시키지 않기 위한 순서)
+    """
+    if _logged_in(ctx):
+        return True
+    if _restore_state(ctx) and _logged_in(ctx):
+        print("[세션] kakao_state.json 백업 세션으로 로그인 상태를 확인했습니다.")
+        return True
+    return False
+
+
+def _login_probe(ctx) -> tuple:
+    """(status, error) — HISTORY_API 를 한 번 호출해 로그인 여부를 본다. 200 이면 로그인 상태."""
+    try:
+        resp = ctx.request.get(
+            f"{HISTORY_API}?page=0&size=1",
+            headers={"User-Agent": MOBILE_UA, "Referer": LOGIN_TARGET},
+        )
+        return resp.status, ""
+    except Exception as exc:
+        return None, str(exc)[:120]
+
+
+def _logged_in(ctx) -> bool:
+    return _login_probe(ctx)[0] == 200
+
+
+def _login_url(target: str = LOGIN_TARGET) -> str:
+    """gift 세션을 발급하는 '데스크톱 웹 로그인' 입구 주소(2026-11-20 실측).
+
+    gift 번들(chunk-ZOOQ4WOZ.js)의 인증 서비스는
+        login() → isKakaotalk || isMobileOrTablet ? loginApp() : getWebAuthUrl()
+    로 갈라진다. 즉 모바일 UA 에서는 로그인 버튼이 /giftbox-redirect(카카오톡 앱 안내)로 빠지고,
+    그 화면의 '카카오 계정으로 로그인하기'는 accounts.kakao.com → /unsup/giftbox 로 돌아와
+    gift 세션을 만들지 못한다. 그래서 모바일 창에서 손으로 로그인해도 체험단 페이지는 계속 로그아웃 상태다.
+
+    데스크톱 분기의 getWebAuthUrl() 이 만드는 주소는 UA 와 무관하게 동작하며,
+    shopping-userauth-web → kauth.kakao.com/oauth/authorize → accounts.kakao.com/login
+    → gift.kakao.com/a/v1/web/login 순서로 돌아와 gift 쿠키를 실제로 발급한다.
+    """
+    inner = f"{GIFT_WEB_LOGIN}?redirectUrl={urllib.parse.quote(target, safe='')}"
+    return f"{AUTH_WEB}/login?channel=GIFT&redirect_url={urllib.parse.quote(inner, safe='')}"
+
+
+def _cookie_summary(cookies: list) -> dict:
+    """도메인별 쿠키 개수만 센다(쿠키 값은 절대 출력하지 않는다)."""
+    out: dict = {}
+    for c in cookies or []:
+        domain = str(c.get("domain") or "").lstrip(".")
+        if domain:
+            out[domain] = out.get(domain, 0) + 1
+    return out
+
+
+def _domain_count(summary: dict, host: str) -> int:
+    """해당 호스트에 직접 설정된 쿠키만 센다('kakao.com' 이 '*.kakao.com' 까지 세지 않게)."""
+    return int(summary.get(host, 0)) + int(summary.get("." + host, 0))
+
+
+def _enter_pressed() -> bool:
+    """검은 창에서 Enter 가 눌렸는지 논블로킹으로 확인(터미널이 아니면 무시)."""
+    try:
+        if not sys.stdin or not sys.stdin.isatty():
+            return False
+        if os.name == "nt":
+            import msvcrt
+            if msvcrt.kbhit():
+                msvcrt.getwch()
+                return True
+            return False
+        import select
+        readable, _, _ = select.select([sys.stdin], [], [], 0)
+        if readable:
+            sys.stdin.readline()
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _wait_for_login(page, ctx, wait_seconds: int = LOGIN_WAIT_SECONDS) -> tuple:
+    """2초 간격으로 로그인 여부를 폴링한다. Enter 를 누르면 즉시 한 번 더 확인한다.
+
+    (2초에 1회만 조회한다. 상대 서비스에 부담을 주지 않도록 0.1초 간격으로 두드리지 않는다.)
+    반환: (로그인여부, 확인횟수)
+    """
+    deadline = time.time() + wait_seconds
+    checks = 0
+    while True:
+        checks += 1
+        if _login_probe(ctx)[0] == 200:
+            return True, checks
+        if time.time() >= deadline:
+            return False, checks
+
+        waited = 0.0
+        while waited < LOGIN_POLL_SECONDS:
+            try:
+                page.wait_for_timeout(100)
+            except Exception:  # 사용자가 창을 닫은 경우
+                return _login_probe(ctx)[0] == 200, checks
+            waited += 0.1
+            if _enter_pressed():
+                break
+        left = int(max(0, deadline - time.time()))
+        print(f"\r  [대기] 로그인 감지 중… {wait_seconds - left}s / {wait_seconds}s "
+              f"(Enter 로 즉시 확인)      ", end="", flush=True)
+
+
+def _verify_mobile_session(p) -> tuple:
+    """로그인 후 실제 신청에 쓰는 모바일(iPhone 14) 화면에서도 세션이 유지되는지 확인한다.
+
+    반환: (HISTORY_API 상태코드 또는 None, 오류문자열)
+    """
+    try:
+        ctx = _launch(p, headless=True, mode="mobile")
+    except Exception as exc:
+        return "launch_error", f"{type(exc).__name__}: {str(exc)[:80]}"
+    try:
+        return _login_probe(ctx)
+    finally:
         try:
-            input("로그인 완료 후 Enter >>> ")
-        except (EOFError, KeyboardInterrupt):
+            ctx.close()
+        except Exception:
             pass
 
-        ok = _logged_in(ctx)
-        if not ok:
-            # 쿠키가 늦게 저장되는 경우가 있어 한 번 더 확인
-            page.wait_for_timeout(1500)
-            ok = _logged_in(ctx)
+
+def run_login(mode: str = "desktop") -> int:
+    from playwright.sync_api import sync_playwright
+
+    login_url = _login_url()
+    where = "데스크톱 크기" if mode == "desktop" else "모바일(iPhone) 크기"
+    with sync_playwright() as p:
+        ctx = _launch(p, headless=False, mode=mode)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+
+        if _ensure_session(ctx):
+            try:
+                page.wait_for_timeout(300)
+                ctx.storage_state(path=STATE_FILE)
+            except Exception:
+                pass
+            ctx.close()
+            print("[완료] 이미 로그인 세션이 있습니다. 세션을 kakao_state.json 에 다시 저장했습니다.")
+            status, err = _verify_mobile_session(p)
+            if status == 200:
+                print("  - [검증] 신청 화면(모바일 모드)에서도 세션 유지 확인 (HISTORY_API 200)")
+            elif status == "launch_error":
+                print(f"  - [안내] 신청 화면 검증은 건너뜀(창 실행 실패: {err}). run_auto.bat 에서 확인됩니다.")
+            else:
+                print(f"  - [경고] 신청 화면(모바일 모드)에서 세션이 인식되지 않습니다"
+                      f"(HTTP {status if status is not None else '없음'}{(' ' + err) if err else ''}).")
+                print("           run_login.bat 을 실행해 로그인을 다시 마쳐 주세요.")
+                return 1
+            print("       이어서 run_dry.bat / run_auto.bat 을 실행하세요.")
+            return 0
+
+        print()
+        print("=" * 68)
+        print(f" 1) 열린 브라우저 창은 [{where}] 입니다. (로그인 전용 창)")
+        print("    카카오 로그인 화면이 자동으로 뜹니다. 카카오톡 QR / 아이디 로그인 모두 가능합니다.")
+        print(" 2) 로그인을 마치면 자동으로 감지됩니다. (2초마다 확인, 최대 3분)")
+        print("    기다리지 않으려면 이 검은 창에서 Enter 를 누르세요.")
+        print(" 3) 창이 저절로 닫히고 [완료] 로그인 세션이 감지·저장되었습니다! 가 나오면 끝입니다.")
+        print("=" * 68)
+        print(f"  로그인 주소: {login_url}")
+        print()
+        try:
+            page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
+        except Exception as exc:
+            print(f"[경고] 로그인 페이지를 여는 중 지연이 있었습니다({type(exc).__name__}). 창을 직접 확인해 주세요.")
+
+        ok, checks = _wait_for_login(page, ctx, LOGIN_WAIT_SECONDS)
+
+        if ok:
+            print("\r" + " " * 70 + "\r", end="")
+            try:
+                page.wait_for_timeout(1500)  # 쿠키 안정화 대기
+            except Exception:
+                pass
+            saved = ""
+            try:
+                ctx.storage_state(path=STATE_FILE)
+                saved = str(Path(STATE_FILE).resolve())
+            except Exception as exc:
+                saved = f"저장 실패({type(exc).__name__})"
+            cookies = []
+            try:
+                cookies = ctx.cookies()
+            except Exception:
+                pass
+            summary = _cookie_summary(cookies)
+            ctx.close()
+            print("[완료] 로그인 세션이 감지·저장되었습니다!")
+            print(f"  - 프로필 폴더: {Path(PROFILE_DIR).resolve()}")
+            print(f"  - 세션 백업: {saved}")
+            print(f"  - 확인 횟수: {checks}회")
+            print(f"  - 쿠키 도메인: {', '.join(f'{d}({n})' for d, n in sorted(summary.items())) or '없음'}")
+            if mode == "desktop":
+                # 데스크톱에서 만든 세션이 실제 신청용 모바일 화면에서도 통하는지 바로 확인
+                status, err = _verify_mobile_session(p)
+                if status == 200:
+                    print("  - [검증] 신청 화면(모바일 모드)에서도 세션 유지 확인 (HISTORY_API 200)")
+                elif status == "launch_error":
+                    print(f"  - [안내] 신청 화면 검증은 건너뜀(창 실행 실패: {err}). run_auto.bat 에서 확인됩니다.")
+                else:
+                    print(f"  - [경고] 신청 화면(모바일 모드)에서 세션이 인식되지 않습니다"
+                          f"(HTTP {status if status is not None else '없음'}{(' ' + err) if err else ''}).")
+                    print("           이 경우 아래 명령으로 모바일 화면에서 직접 로그인해 주세요:")
+                    print("             python main.py --login-mobile")
+                    return 3
+            print("  이제 run_dry.bat / run_auto.bat 을 실행하세요.")
+            return 0
+
+        # ---- 실패 진단 ----
+        status, err = _login_probe(ctx)
+        try:
+            current_url = page.url
+        except Exception:
+            current_url = "(알 수 없음)"
+        try:
+            cookies = ctx.cookies()
+        except Exception:
+            cookies = []
+        summary = _cookie_summary(cookies)
         ctx.close()
 
-    if ok:
-        print("[완료] 로그인 세션이 저장되었습니다. 이제 run_dry.bat / run_auto.bat 을 실행하세요.")
-        return 0
-    print("[확인 필요] 로그인이 확인되지 않았습니다. 카카오 로그인을 끝까지 마쳤는지 확인한 뒤")
-    print("           run_login.bat 을 다시 실행해 주세요.")
-    return 1
+        print("\r" + " " * 70 + "\r", end="")
+        print("[확인 필요] 로그인이 확인되지 않았습니다.")
+        print(f"  - HISTORY_API 응답: HTTP {status if status is not None else '없음'}"
+              f"{(' ' + err) if err else ''}")
+        print(f"  - 현재 브라우저 주소: {current_url}")
+        print(f"  - 저장된 쿠키: {', '.join(f'{d}({n})' for d, n in sorted(summary.items())) or '없음'}")
+        print(f"    (핵심: gift.kakao.com {_domain_count(summary, 'gift.kakao.com')}개 / "
+              f"kakao.com {_domain_count(summary, 'kakao.com')}개 / "
+              f"shopping-userauth-web.kakao.com {_domain_count(summary, 'shopping-userauth-web.kakao.com')}개)")
+        print("  - gift 세션은 로그인 후 gift.kakao.com/a/v1/web/login 를 거쳐야 만들어집니다.")
+        print("    계정 로그인만 하고 그 화면에 머물렀다면 세션이 만들어지지 않습니다.")
+        print("    위 주소가 accounts.kakao.com 이면 로그인이 끝나지 않은 상태입니다.")
+        print("    run_login.bat 을 다시 실행해 로그인을 끝까지 마쳐 주세요.")
+        return 1
 
 
 # ---- 신청 화면 조작 헬퍼 ---------------------------------------------------
@@ -593,7 +890,9 @@ def apply_one(page, campaign: dict, skip_wishlist: bool = False) -> dict:
 
         # 로그인이 플렸거나 세션이 만료된 경우
         if "accounts.kakao.com" in page.url or "/login" in page.url \
-                or "카카오계정으로 로그인" in body_text or "로그인이 필요" in body_text:
+                or "giftbox-redirect" in page.url or "/unsup/" in page.url \
+                or "카카오계정으로 로그인" in body_text or "로그인이 필요" in body_text \
+                or "선물함 로그인 안내" in body_text or "카카오 계정으로 로그인하기" in body_text:
             raise LoginRequired()
         if "pc-restricted" in page.url:
             result.update(status="실패", reason="PC 제한 화면으로 이동(모바일 UA 확인 필요)")
@@ -703,12 +1002,24 @@ def run_apply(candidates: list, args) -> int:
 
     results = []
     with sync_playwright() as p:
-        ctx = _launch(p, headless=args.headless)
+        ctx = _launch(p, headless=args.headless, mode="mobile")
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
-        if not _logged_in(ctx):
+        if not _ensure_session(ctx):
+            status, err = _login_probe(ctx)
+            try:
+                cookies = ctx.cookies()
+            except Exception:
+                cookies = []
+            summary = _cookie_summary(cookies)
             ctx.close()
-            print("[중단] 로그인 세션이 없습니다. 먼저 run_login.bat(python main.py --login)을 실행하세요.")
+            print(f"[중단] 로그인 세션이 없습니다 (HISTORY_API HTTP {status}{(' ' + err) if err else ''}).")
+            print(f"       쿠키: {', '.join(f'{d}({n})' for d, n in sorted(summary.items())) or '없음'}")
+            print(f"       (핵심: gift.kakao.com {_domain_count(summary, 'gift.kakao.com')}개 / "
+                  f"kakao.com {_domain_count(summary, 'kakao.com')}개 / "
+                  f"shopping-userauth-web.kakao.com {_domain_count(summary, 'shopping-userauth-web.kakao.com')}개)")
+            print("       먼저 run_login.bat(데스크톱 로그인 창)을 실행해 로그인을 끝까지 마쳤 주세요.")
+            print("       (체험단 화면에서 뜨는 '카카오 계정으로 로그인하기'로는 gift 세션이 만들어지지 않습니다.)")
             return 2
 
         for idx, item in enumerate(targets, 1):
@@ -718,7 +1029,7 @@ def run_apply(candidates: list, args) -> int:
                 res = apply_one(page, item, skip_wishlist=args.skip_wishlist)
             except LoginRequired:
                 print("로그인 필요 → 중단")
-                print("[중단] 로그인이 풀렸습니다. run_login.bat 으로 다시 로그인한 뒤 재실행하세요.")
+                print("[중단] 로그인이 풀렸습니다. run_login.bat(데스크톱 로그인 창)으로 다시 로그인한 뒤 재실행하세요.")
                 break
             results.append(res)
             print(f"{res['status']} ({res['reason'][:80]})")
@@ -753,6 +1064,8 @@ def main(argv=None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--login", action="store_true", help="최초 1회 카카오 로그인 후 세션 저장")
+    ap.add_argument("--login-mobile", action="store_true",
+                    help="--login 과 함께: 모바일(iPhone) 화면에서 로그인 (데스크톱 로그인으로 세션이 안 잡힐 때)")
     ap.add_argument("--dry-run", action="store_true", help="실제 신청 없이 후보 목록만 출력")
     ap.add_argument("--limit", type=int, default=30, help="실제 신청할 최대 개수 (기본 30)")
     ap.add_argument("--sort", choices=["popular", "deadline"], default="popular",
@@ -770,9 +1083,9 @@ def main(argv=None) -> int:
     if args.delay_min > args.delay_max:
         args.delay_min, args.delay_max = args.delay_max, args.delay_min
 
-    if args.login:
+    if args.login or args.login_mobile:
         try:
-            return run_login()
+            return run_login("mobile" if args.login_mobile else "desktop")
         except ImportError:
             print("[오류] playwright 가 설치되지 않았습니다. install.bat 을 먼저 실행하세요.")
             return 1

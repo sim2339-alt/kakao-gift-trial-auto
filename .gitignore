@@ -1,5 +1,7 @@
 # 로그인 세션(브라우저 프로필) — 절대 공유/커밋 금지
 kakao_profile/
+# 로그인 세션 백업(storage_state) — 절대 공유/커밋 금지
+kakao_state.json
 
 # 실행 결과물
 logs/

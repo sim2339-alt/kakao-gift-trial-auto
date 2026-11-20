@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -299,9 +300,80 @@ def cleanup():
         path.unlink(missing_ok=True)
 
 
+def test_login_logic():
+    print("[3/3] 로그인 로직 검증 (네트워크 없이)")
+    url = main._login_url()
+    check("로그인 주소가 웹 로그인 입구(shopping-userauth-web)인가",
+          url.startswith("https://shopping-userauth-web.kakao.com/login?channel=GIFT&redirect_url="), url[:80])
+    check("로그인 주소에 gift /a/v1/web/login 복귀 지점이 포함",
+          "gift.kakao.com%2Fa%2Fv1%2Fweb%2Flogin" in url, url)
+    check("로그인 주소에 체험단 경로가 이중 인코딩으로 포함",
+          "giftbox%252Ftrial-campaign" in url, url)
+    check("로그인 주소에 모바일 앱 안내(/giftbox-redirect·gift-talk) 없음",
+          "giftbox-redirect" not in url and "gift-talk" not in url)
+
+    # 도메인별 쿠키 개수(값 미출력)
+    cookies = [
+        {"name": "a", "value": "secret", "domain": ".kakao.com"},
+        {"name": "b", "value": "secret", "domain": "gift.kakao.com"},
+        {"name": "c", "value": "secret", "domain": ".gift.kakao.com"},
+        {"name": "d", "value": "secret", "domain": "shopping-userauth-web.kakao.com"},
+    ]
+    summary = main._cookie_summary(cookies)
+    check("쿠키 도메인 집계", summary.get("kakao.com") == 1 and summary.get("gift.kakao.com") == 2,
+          str(summary))
+
+    # storage_state 파일 → CookieJar
+    tmp = ROOT / "logs" / "_test_state.json"
+    tmp.parent.mkdir(exist_ok=True)
+    tmp.write_text(json.dumps({"cookies": [
+        {"name": "_kau", "value": "x", "domain": ".kakao.com", "path": "/",
+         "expires": -1, "httpOnly": True, "secure": True, "sameSite": "Lax"},
+        {"name": "gift_session", "value": "y", "domain": "gift.kakao.com", "path": "/",
+         "expires": 1893456000.0, "httpOnly": True, "secure": True, "sameSite": "Lax"},
+    ]}, ensure_ascii=False), encoding="utf-8")
+    loaded = main._load_state_cookies(str(tmp))
+    check("storage_state 쿠키 읽기", len(loaded) == 2, str(len(loaded)))
+    jar = main._cookie_jar(loaded)
+    check("쿠키 → CookieJar 변환", len(jar) == 2, str(len(jar)))
+    tmp.unlink(missing_ok=True)
+
+    # 폴링: 3번째 확인에서 200 이 나오면 즉시 성공 반환
+    class FakeCtx:
+        def __init__(self, ok_at):
+            self.calls = 0
+            self.ok_at = ok_at
+
+        class _Resp:
+            def __init__(self, status):
+                self.status = status
+
+        class _Req:
+            def __init__(self, outer):
+                self.outer = outer
+
+            def get(self, url, headers=None):
+                self.outer.calls += 1
+                return FakeCtx._Resp(200 if self.outer.calls >= self.outer.ok_at else 401)
+
+        @property
+        def request(self):
+            return FakeCtx._Req(self)
+
+    class FakeWaitPage:
+        def wait_for_timeout(self, ms):
+            time.sleep(ms / 1000.0)  # 실제 대기처럼 시간을 흘려보낸다
+
+    ok, checks = main._wait_for_login(FakeWaitPage(), FakeCtx(ok_at=2), wait_seconds=30)
+    check("로그인 폴링: 2번째 확인에서 감지 후 즉시 종료", ok is True and checks <= 3, f"ok={ok} checks={checks}")
+    ok, checks = main._wait_for_login(FakeWaitPage(), FakeCtx(ok_at=10 ** 6), wait_seconds=1)
+    check("로그인 폴링: 시간 초과 시 실패 반환", ok is False, f"ok={ok}")
+
+
 if __name__ == "__main__":
     test_filter()
     test_apply_flow()
+    test_login_logic()
     cleanup()
     print()
     if FAILS:
