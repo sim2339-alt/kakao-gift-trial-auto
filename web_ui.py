@@ -1161,11 +1161,14 @@ async function refreshStatus(){
   $("ver").textContent = st.version || "-";
   const login = st.login || {};
   /* 지금 로그인된 카카오 계정 — 서브.연 / 서브.오 를 바꿨는지 배지에서 바로 본다 */
-  const acct = login.nickname || (login.account && login.account.masked_key) || "";
-  if(login.state === "ok") setPill($("loginPill"), "ok", acct ? "로그인됨 · " + acct : "로그인됨 · 계정 이름 확인 불가");
+  const nick = login.nickname || "";
+  const mask = (login.account && login.account.masked_key) || "";
+  const acct = nick || mask;
+  const acctText = acct ? (nick && mask ? acct + " (" + mask + ")" : acct) : "";
+  if(login.state === "ok") setPill($("loginPill"), "ok", acctText ? "로그인됨 · " + acctText : "로그인됨 · 계정 이름 확인 불가");
   else if(login.state === "none") setPill($("loginPill"), "warn", login.detail || "로그인 필요");
   else setPill($("loginPill"), "", login.detail || "로그인 확인 필요");
-  $("loginPill").title = (login.detail || "") + (acct ? " · 계정: " + acct : "")
+  $("loginPill").title = (login.detail || "") + (acctText ? " · 계정: " + acctText : "")
     + (login.checked_at ? " · 확인 " + login.checked_at : "");
 
   const n = st.notion || {};

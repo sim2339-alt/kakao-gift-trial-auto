@@ -2103,6 +2103,8 @@ def test_session_cache():
         check("로그인 상태: 닉네임을 함께 돌려준다",
               st.get("state") == "ok" and st.get("nickname") == "서브.오" and "서브.오" in (st.get("detail") or ""),
               str(st))
+        check("로그인 상태: 계정 식별자(ID …6789)도 함께 보여 준다",
+              "ID …6789" in (st.get("detail") or ""), str(st.get("detail")))
 
         # 8) 닉네임을 못 읽어도 로그인 상태는 유지(오탐으로 '로그아웃' 표시하지 않음)
         current["nick"] = None

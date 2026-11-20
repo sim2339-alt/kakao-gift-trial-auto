@@ -403,9 +403,12 @@ def login_state() -> dict:
     if status == 200:
         account = fetch_account()
         nickname = (account or {}).get("nickname")
+        masked = (account or {}).get("masked_key")
         detail = "신청 이력 API 200 — 로그인 유지 중"
         if nickname:
-            detail += f" · 계정: {nickname}"
+            detail += f" · 계정: {nickname}" + (f" ({masked})" if masked else "")
+        elif masked:
+            detail += f" · 계정: {masked}"
         elif account:
             detail += " · 계정 이름은 확인하지 못했습니다"
         return {"state": "ok", "detail": detail, "nickname": nickname, "account": account}
