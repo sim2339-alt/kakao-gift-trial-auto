@@ -767,6 +767,101 @@ def test_notion():
           str(main.apply_one.__code__.co_varnames))
 
 
+# ------------------------------------------- 5부: main() 실행 모드 통합 점검
+class FakeStdin:
+    def __init__(self, tty=True):
+        self.tty = tty
+
+    def isatty(self):
+        return self.tty
+
+
+def test_main_modes():
+    print("[5/5] 실행 모드 통합 검증 (main() — 네트워크·브라우저 없이)")
+    items = [
+        build_item("스누피 3단 전기요", [(97, "디지털·가전", 163, "계절가전")]),
+        build_item("수플린 설향딸기 800g", [(93, "식품", 203, "과일·견과")]),
+        build_item("무드웨어 블러 립스틱", [(95, "뷰티", 181, "메이크업")]),   # 제외 대상
+    ]
+    saved = {
+        "collect_campaigns": main.collect_campaigns,
+        "collect_applied_ids": main.collect_applied_ids,
+        "load_notion_config": main.load_notion_config,
+        "notion_scan": main.notion_scan,
+        "run_apply": main.run_apply,
+        "stdin": sys.stdin,
+    }
+    seen = []
+
+    def fake_run_apply(candidates, args):
+        seen.append({"count": len(candidates),
+                     "limit": args.limit,
+                     "notion": getattr(args, "notion_cfg", None),
+                     "ids": [c["campaignId"] for c in candidates]})
+        return 0
+
+    main.collect_campaigns = lambda mp: items
+    main.collect_applied_ids = lambda: None
+    main.load_notion_config = lambda path=None, column=None: {
+        "token": "ntn_dummy", "db_id": "db", "column": column or "메인.엽", "file": "x"}
+    main.run_apply = fake_run_apply
+    try:
+        # (1) 인자 없이 대화형: 모드 2 + 개수 10
+        sys.stdin = FakeStdin(True)
+        with use_input(["2", "10"]):
+            rc = main.main([])
+        check("모드: 대화형 2번 → 개수 10", rc == 0 and seen[-1]["limit"] == 10, f"rc={rc} {seen[-1:]}")
+
+        # (2) 인자 없이 대화형: 모드 1 → 노션 미체크만 + 개수 5
+        main.notion_scan = lambda cfg, transport=None: {
+            "id-스누피 3단": {"page_id": "p1", "title": "t", "mark": "11/20 O"},   # 체크됨 → 제외
+            "id-수플린 설향": {"page_id": "p2", "title": "t", "mark": ""},          # 미체크 → 우선
+        }
+        with use_input(["1", "5"]):
+            rc = main.main([])
+        got = seen[-1]
+        check("모드1: 노션 체크된 상품 제외", "id-스누피 3단" not in got["ids"], str(got["ids"]))
+        check("모드1: 미체크 상품은 대상에 포함", "id-수플린 설향" in got["ids"], str(got["ids"]))
+        check("모드1: 개수 5 로 진행", rc == 0 and got["limit"] == 5, f"rc={rc} {got}")
+        check("모드1: 노션 설정이 run_apply 로 전달", got["notion"] is not None, str(got["notion"]))
+
+        # (3) --notion-pending + --limit: 묻지 않고 바로 실행(배치)
+        with use_input([]) as fake:
+            rc = main.main(["--notion-pending", "--limit", "2"])
+        check("배치: --notion-pending --limit 2 → 묻지 않음", rc == 0 and seen[-1]["limit"] == 2
+              and fake.prompts == [], f"rc={rc} prompts={fake.prompts}")
+        check("배치: 미체크만 신청", "id-스누피 3단" not in seen[-1]["ids"], str(seen[-1]["ids"]))
+
+        # (4) --limit 만 주면 모드 2 로 바로 실행
+        with use_input([]) as fake:
+            rc = main.main(["--limit", "3"])
+        check("배치: --limit 만 → 모드2·개수3", rc == 0 and seen[-1]["limit"] == 3 and fake.prompts == [],
+              f"rc={rc} prompts={fake.prompts}")
+
+        # (5) --no-notion 이면 노션 설정을 아예 쓰지 않는다
+        with use_input(["2"]):
+            rc = main.main(["--limit", "3", "--no-notion"])
+        check("--no-notion: 노션 설정 없음", rc == 0 and seen[-1]["notion"] is None, str(seen[-1]))
+
+        # (6) 1번 모드인데 노션 설정이 없으면 중단(중복 신청 방지)
+        main.load_notion_config = lambda path=None, column=None: None
+        sys.stdin = FakeStdin(False)
+        rc = main.main(["--notion-pending", "--limit", "5"])
+        check("모드1: 노션 설정 없으면 중단", rc == 1, f"rc={rc}")
+
+        # (7) --limit 0 은 거부
+        sys.stdin = FakeStdin(False)
+        rc = main.main(["--limit", "0"])
+        check("--limit 0 → 중단", rc == 1, f"rc={rc}")
+    finally:
+        main.collect_campaigns = saved["collect_campaigns"]
+        main.collect_applied_ids = saved["collect_applied_ids"]
+        main.load_notion_config = saved["load_notion_config"]
+        main.notion_scan = saved["notion_scan"]
+        main.run_apply = saved["run_apply"]
+        sys.stdin = saved["stdin"]
+
+
 def cleanup():
     for path in (ROOT / "logs").glob("fail_*.html"):
         path.unlink(missing_ok=True)
@@ -847,6 +942,7 @@ if __name__ == "__main__":
     test_apply_flow()
     test_login_logic()
     test_notion()
+    test_main_modes()
     cleanup()
     print()
     if FAILS:

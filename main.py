@@ -1769,7 +1769,11 @@ def main(argv=None) -> int:
     interactive = (not (args.login or args.login_mobile or args.dry_run)) and sys.stdin.isatty()
     mode = "notion" if args.notion_pending else "list"
     if args.limit is None:
-        if interactive:
+        if interactive and mode == "notion":
+            # --notion-pending 을 이미 줬으면 모드는 다시 묻지 않고 개수만 묻는다.
+            args.limit = ask_limit(LIMIT_DEFAULT_UNCHECKED,
+                                   f"몇 개 신청할까요? (그냥 Enter 시 최대 {LIMIT_DEFAULT_UNCHECKED}개): ")
+        elif interactive:
             mode, args.limit = ask_run_mode()
         else:
             args.limit = LIMIT_DEFAULT_UNCHECKED if mode == "notion" else LIMIT_DEFAULT
