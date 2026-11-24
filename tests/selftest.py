@@ -13,6 +13,7 @@
 - 9부: 카카오 로그아웃(세션 파일 삭제 → 다른 계정 로그인) — CLI·웹 검증
 - 10부: 담당자 열 목록 — 노션 페이지 주소 붙여넣기 정규화 · `_columns` 폴백 · [↻ 새로고침] 검증
 - 11부: 계정 전환 캐시 — 세션 파일이 바뀌면 새 쿠키 · 로그아웃 초기화 · 로그인 계정 닉네임 · 이미 신청 건수 검증
+- 12부: 카카오 닉네임 → 노션 담당자 열 자동 선택 — 매칭 점수 · 계정 변경 · 수동 선택 보호 검증
 """
 
 from __future__ import annotations
@@ -86,7 +87,7 @@ def build_item(title, cats):
 
 
 def test_filter():
-    print("[1/11] 필터 검증")
+    print("[1/12] 필터 검증")
     flt = main.load_filter()
     cases = {
         "수플린 설향딸기 800g": "allow",
@@ -349,7 +350,7 @@ class FakePage:
 
 
 def test_apply_flow():
-    print("[2/11] 신청 플로우 검증 (가짜 브라우저)")
+    print("[2/12] 신청 플로우 검증 (가짜 브라우저)")
     campaign = {
         "campaignId": "abc",
         "campaignTitle": "테스트 상품",
@@ -604,7 +605,7 @@ class use_input:
 
 
 def test_notion():
-    print("[4/11] 노션 기록·설정·실행 모드 검증 (가짜 노션 API)")
+    print("[4/12] 노션 기록·설정·실행 모드 검증 (가짜 노션 API)")
     NOW = datetime(2026, 11, 20, 11, 0, 0)
     CFG = {"token": "ntn_dummy", "db_id": "db-dummy", "column": "메인.엽", "file": "notion_secret.json"}
     item = {
@@ -856,7 +857,7 @@ class FakeStdin:
 
 
 def test_main_modes():
-    print("[5/11] 실행 모드 통합 검증 (main() — 네트워크·브라우저 없이)")
+    print("[5/12] 실행 모드 통합 검증 (main() — 네트워크·브라우저 없이)")
     items = [
         build_item("스누피 3단 전기요", [(97, "디지털·가전", 163, "계절가전")]),
         build_item("수플린 설향딸기 800g", [(93, "식품", 203, "과일·견과")]),
@@ -979,7 +980,7 @@ def cleanup():
 
 # --------------------------------------------- 6부: 웹 조종판(web_ui) 검증
 def test_web():
-    print("[6/11] 웹 조종판 API 검증 (가짜 카카오·노션, 실제 HTTP 서버)")
+    print("[6/12] 웹 조종판 API 검증 (가짜 카카오·노션, 실제 HTTP 서버)")
     import web_ui
 
     web_ui.reset_state()
@@ -1170,7 +1171,7 @@ def test_web():
 
 
 def test_login_logic():
-    print("[3/11] 로그인 로직 검증 (네트워크 없이)")
+    print("[3/12] 로그인 로직 검증 (네트워크 없이)")
     url = main._login_url()
     check("로그인 주소가 웹 로그인 입구(shopping-userauth-web)인가",
           url.startswith("https://shopping-userauth-web.kakao.com/login?channel=GIFT&redirect_url="), url[:80])
@@ -1241,7 +1242,7 @@ def test_login_logic():
 
 # --------------------- 7부: 노션 1회 저장 · 담당자 열만 선택(다시 묻지 않음)
 def test_notion_once():
-    print("[7/11] 노션 1회 저장 · 담당자 열만 선택 검증 (가짜 노션 API)")
+    print("[7/12] 노션 1회 저장 · 담당자 열만 선택 검증 (가짜 노션 API)")
     tmp = ROOT / "logs" / "_once_notion_secret.json"
     tmp.parent.mkdir(exist_ok=True)
     tmp.write_text(json.dumps({"enabled": True, "token": "ntn_saved_once", "db_id": "db-once",
@@ -1423,7 +1424,7 @@ def test_notion_once():
 
 # ------------------------------- 8부: 원스톱 실행(run.bat) · 루트 정리 · 한 화면 흐름
 def test_onestop():
-    print("[8/11] 원스톱 실행기(run.bat) · 루트 정리 · 웹 한 화면 흐름 검증")
+    print("[8/12] 원스톱 실행기(run.bat) · 루트 정리 · 웹 한 화면 흐름 검증")
     root = ROOT
     run_bat = root / "run.bat"
     run_sh = root / "run.sh"
@@ -1483,7 +1484,7 @@ def test_onestop():
 
 
 def test_logout():
-    print("[9/11] 카카오 로그아웃 검증 (세션 파일 삭제 · CLI · 웹)")
+    print("[9/12] 카카오 로그아웃 검증 (세션 파일 삭제 · CLI · 웹)")
     import web_ui
 
     prof = ROOT / "logs" / "_logout_profile"
@@ -1638,7 +1639,7 @@ class StrictNotionStub:
 
 
 def test_column_discovery():
-    print("[10/11] 담당자 열 목록 — 주소 정규화 · 토큰만으로 DB 자동 찾기 · 폴백 · 새로고침 검증")
+    print("[10/12] 담당자 열 목록 — 주소 정규화 · 토큰만으로 DB 자동 찾기 · 폴백 · 새로고침 검증")
     import web_ui
 
     read = lambda: (ROOT / "web_ui.py").read_text(encoding="utf-8")
@@ -1946,7 +1947,7 @@ def test_column_discovery():
 
 # ------------- 11부: 계정 전환 캐시 — 세션 파일 변경 · 로그아웃 · 계정 닉네임 · 이미 신청 건수
 def test_session_cache():
-    print("[11/11] 계정 전환 캐시 — 세션 파일 변경 시 새 쿠키 · 로그아웃 초기화 · 계정 닉네임 · 이미 신청 건수 검증")
+    print("[11/12] 계정 전환 캐시 — 세션 파일 변경 시 새 쿠키 · 로그아웃 초기화 · 계정 닉네임 · 이미 신청 건수 검증")
     import web_ui
 
     statef = ROOT / "logs" / "_session_state.json"
@@ -2155,6 +2156,196 @@ def test_session_cache():
         shutil.rmtree(prof, ignore_errors=True)
 
 
+# ------------- 12부: 카카오 닉네임 → 노션 담당자 열 자동 선택
+def test_nickname_columns():
+    print("[12/12] 카카오 닉네임 → 노션 담당자 열 자동 선택 (매칭 점수 · 계정 변경 · 수동 선택 보호)")
+    import web_ui
+
+    # 현황표 담당자 열의 실제 모양(접두사 + 핵심 이름 + 괄호 설명) — 타인 실명은 쓰지 않고 예시 이름만 쓴다
+    cols = ["메인.엽", "1팀.엽2(2200)", "서브.동", "서브.문", "서브.연",
+            "서브.오", "서브.완", "서브.주", "서브.준", "서브.택"]
+
+    # 1) 열 이름 분해
+    check("열 분해: '메인.엽' → ('메인', '엽')",
+          main.notion_column_core("메인.엽") == ("메인", "엽"), str(main.notion_column_core("메인.엽")))
+    check("열 분해: '1팀.엽2(2200)' → ('1팀', '엽2') — 괄호 설명은 이름이 아니다",
+          main.notion_column_core("1팀.엽2(2200)") == ("1팀", "엽2"),
+          str(main.notion_column_core("1팀.엽2(2200)")))
+    check("열 분해: 구분자가 없으면 열 이름 전체가 핵심 이름",
+          main.notion_column_core("담당자") == ("", "담당자"), str(main.notion_column_core("담당자")))
+
+    # 2) 매칭 규칙 — 닉네임만 보고 고른다
+    check("매칭: '이신엽' → '메인.엽'", main.match_notion_column_by_nickname("이신엽", cols) == "메인.엽",
+          str(main.match_notion_column_detail("이신엽", cols)))
+    check("매칭: '신엽' → '메인.엽'(성 제외 이름도 인정)",
+          main.match_notion_column_by_nickname("신엽", cols) == "메인.엽")
+    check("매칭: '오정원' → '서브.오'(성씨 일치)",
+          main.match_notion_column_by_nickname("오정원", cols) == "서브.오",
+          str(main.match_notion_column_detail("오정원", cols)))
+    check("매칭: '엽2' → '1팀.엽2(2200)'(괄호 제외한 핵심 이름 일치)",
+          main.match_notion_column_by_nickname("엽2", cols) == "1팀.엽2(2200)",
+          str(main.match_notion_column_detail("엽2", cols)))
+    check("매칭: '엽2'일 때 1글자 '엽'(메인.엽)보다 2글자 일치가 우선",
+          main.match_notion_column_detail("엽2", cols).get("score", 0) > 900,
+          str(main.match_notion_column_detail("엽2", cols).get("column")))
+    check("매칭: 열 이름과 완전 일치(공백·대소문자 무시)를 가장 높게 본다",
+          main.match_notion_column_detail(" 메인 . 엽 ", cols).get("column") == "메인.엽"
+          and main.match_notion_column_detail(" 메인 . 엽 ", cols).get("score") >= 1000
+          and "완전" in (main.match_notion_column_detail(" 메인 . 엽 ", cols).get("reason") or ""),
+          str(main.match_notion_column_detail(" 메인 . 엽 ", cols)))
+
+    cols_with_sua = cols + ["서브.수아"]
+    check("매칭: '김수아' → '서브.수아'(2글자 핵심 이름이 닉네임에 포함)",
+          main.match_notion_column_by_nickname("김수아", cols_with_sua) == "서브.수아",
+          str(main.match_notion_column_detail("김수아", cols_with_sua)))
+    check("매칭: '수아' → '서브.수아'", main.match_notion_column_by_nickname("수아", cols_with_sua) == "서브.수아")
+    check("매칭: 2글자 일치가 1글자 일치보다 높은 점수",
+          main.match_notion_column_detail("수아", cols_with_sua).get("score", 0)
+          > main.match_notion_column_detail("오정원", cols).get("score", 0))
+    check("매칭: '서브.수아'가 없으면 '김수아'는 None(엉뚱한 열을 고르지 않는다)",
+          main.match_notion_column_by_nickname("김수아", cols) is None,
+          str(main.match_notion_column_detail("김수아", cols)))
+
+    # 3) 확신이 없을 때: None — 부르는 쪽이 저장된 열을 유지한다
+    no_match = main.match_notion_column_detail("테스트계정", cols)
+    check("매칭 없음 → None", main.match_notion_column_by_nickname("테스트계정", cols) is None)
+    check("매칭 없음 사유를 남긴다", no_match.get("score") == 0 and "찾지 못했습니다" in (no_match.get("reason") or ""),
+          str(no_match))
+    check("닉네임 없음 → None", main.match_notion_column_by_nickname("", cols) is None
+          and main.match_notion_column_by_nickname(None, cols) is None)
+    check("열 목록 없음 → None", main.match_notion_column_by_nickname("이신엽", []) is None
+          and main.match_notion_column_by_nickname("이신엽", None) is None)
+    check("account_id 는 점수를 바꾸지 않고 결과에만 담긴다",
+          main.match_notion_column_detail("오정원", cols, account_id="ID …1234").get("column") == "서브.오"
+          and main.match_notion_column_detail("오정원", cols, account_id="ID …1234").get("account_id") == "ID …1234")
+
+    # 4) 웹 조종판 — 로그인 계정이 바뀌면 열을 자동으로 고른다(파일은 임시 파일)
+    tmp = ROOT / "logs" / "_auto_notion_secret.json"
+    tmp.parent.mkdir(exist_ok=True)
+    tmp.write_text(json.dumps({"enabled": True, "token": "ntn_auto_probe", "db_id": "db-auto",
+                               "column": "메인.엽"}, ensure_ascii=False), encoding="utf-8")
+    saved = {k: getattr(main, k) for k in ("NOTION_SECRET_FILE", "notion_list_columns", "login_state")}
+    main.NOTION_SECRET_FILE = str(tmp)
+    main.notion_list_columns = lambda db, tok, transport=None: list(cols)
+    web_ui.reset_state()
+
+    def login_of(nick, key="ID …1234"):
+        return {"state": "ok", "detail": f"테스트 · {nick}", "nickname": nick,
+                "account": {"nickname": nick, "masked_key": key}}
+
+    def secret():
+        return json.loads(tmp.read_text(encoding="utf-8"))
+
+    try:
+        web_ui.STATE["columns"] = list(cols)
+
+        # 4-1) 로그인 확인 → 닉네임과 맞는 열을 고르고 기록에 남긴다
+        web_ui.STATE["login"] = login_of("이신엽")
+        first = web_ui.apply_auto_column(trigger="login")
+        check("자동 선택: '이신엽' 로그인 → '메인.엽'",
+              bool(first) and first.get("column") == "메인.엽", str(first))
+        rec = secret().get("_auto_column") or {}
+        check("자동 선택: 기록을 파일에 남긴다(자동=True · 점수)",
+              rec.get("column") == "메인.엽" and rec.get("auto") is True and rec.get("score", 0) > 0, str(rec))
+        check("자동 선택: 기록에 토큰이 들어가지 않는다", "ntn_auto_probe" not in json.dumps(rec, ensure_ascii=False))
+
+        # 4-2) 같은 계정이면 다시 맞추지 않는다(손으로 고른 열 보호)
+        again = web_ui.apply_auto_column(trigger="login")
+        check("자동 선택: 같은 계정이면 다시 맞추지 않는다", bool(again) and again.get("changed") is False
+              and bool(again.get("skipped")), str(again))
+
+        # 4-3) 계정이 바뀌면 그 계정 닉네임의 열로 바뀐다
+        web_ui.STATE["login"] = login_of("오정원", "ID …9999")
+        second = web_ui.apply_auto_column(trigger="login")
+        check("자동 선택: 계정 변경 → '서브.오' 열로 바뀜",
+              bool(second) and second.get("changed") is True and secret()["column"] == "서브.오", str(second))
+        check("자동 선택: 바뀐 열을 파일에 저장(토큰·DB ID 보존)",
+              secret()["token"] == "ntn_auto_probe" and secret()["db_id"] == "db-auto", str(secret()))
+        check("자동 선택: 로그 창에 무엇을 골랐는지 남긴다",
+              any("[자동 선택]" in line and "서브.오" in line for line in web_ui.STATE["console"]),
+              str(web_ui.STATE["console"][-3:]))
+
+        # 4-4) 닉네임이 같아도 계정 ID 가 다르면 다른 계정으로 본다(배지의 ID …끝4자리)
+        web_ui.STATE["login"] = login_of("오정원", "ID …1111")
+        other_id = web_ui.apply_auto_column(trigger="login")
+        check("자동 선택: 닉네임이 같아도 ID 가 다르면 새 계정으로 판단",
+              bool(other_id) and other_id.get("skipped") is None, str(other_id))
+
+        # 4-5) 사용자가 직접 고른 열은 같은 계정에서 덮어쓰지 않는다
+        web_ui.STATE["login"] = login_of("오정원", "ID …9999")
+        web_ui.save_column("서브.동")
+        web_ui.mark_manual_column("서브.동")
+        kept = web_ui.apply_auto_column(trigger="login")
+        check("자동 선택: 손으로 고른 열('서브.동')을 덮어쓰지 않는다",
+              bool(kept) and secret()["column"] == "서브.동", str(kept))
+        check("자동 선택: 수동 선택은 auto=False 로 기록",
+              (secret().get("_auto_column") or {}).get("auto") is False, str(secret().get("_auto_column")))
+        check("자동 선택: 수동 선택 뒤 화면은 '자동 선택됨'을 표시하지 않는다",
+              web_ui.api_status()["notion"]["auto"]["active"] is False,
+              str(web_ui.api_status()["notion"]["auto"]))
+
+        # 4-6) 열 목록을 새로 읽었을 때 — 저장된 열이 사라졌으면 다시 맞춘다
+        data = secret()
+        data["column"] = "서브.사라진열"
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        web_ui.STATE["columns"] = list(cols)
+        reloaded = web_ui.apply_auto_column(columns=cols, trigger="columns")
+        check("열 목록 새로고침: 사라진 열이면 닉네임으로 다시 고른다",
+              bool(reloaded) and reloaded.get("changed") is True and secret()["column"] == "서브.오", str(reloaded))
+        again_cols = web_ui.apply_auto_column(columns=cols, trigger="columns")
+        check("열 목록 새로고침: 자동 선택값 그대로면 같은 열을 유지",
+              bool(again_cols) and secret()["column"] == "서브.오", str(again_cols))
+        web_ui.save_column("서브.준")
+        web_ui.mark_manual_column("서브.준")
+        manual_kept = web_ui.apply_auto_column(columns=cols, trigger="columns")
+        check("열 목록 새로고침: 손으로 고른 열은 그대로 둔다",
+              bool(manual_kept) and secret()["column"] == "서브.준" and bool(manual_kept.get("skipped")),
+              str(manual_kept))
+
+        # 4-7) 맞는 열이 없는 닉네임 — 기존 열 유지 + 안내 문구
+        web_ui.STATE["login"] = login_of("테스트계정", "ID …5555")
+        none_found = web_ui.apply_auto_column(trigger="login")
+        check("자동 선택: 맞는 열이 없으면 기존 열을 유지",
+              bool(none_found) and none_found.get("changed") is False and secret()["column"] == "서브.준",
+              str(none_found))
+        auto_info = web_ui.api_status()["notion"]["auto"]
+        check("자동 선택: 맞는 열이 없었다는 안내를 화면에 전달",
+              auto_info.get("active") is False and "찾지 못했습니다" in (auto_info.get("note") or ""),
+              str(auto_info))
+
+        # 4-8) api_status — 지금 열이 자동 선택값이면 active(화면이 '(자동 선택됨)' 표시)
+        web_ui.STATE["login"] = login_of("오정원", "ID …9999")
+        web_ui.save_column("서브.오")
+        data = secret()
+        data["_auto_column"] = {"account": "오정원|ID …9999", "nickname": "오정원", "column": "서브.오",
+                                "auto": True, "score": 480, "at": "2026-11-24 10:00:00"}
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        st = web_ui.api_status()["notion"]
+        check("웹 상태: 지금 열이 자동 선택값이면 active",
+              st["auto"]["active"] is True and st["auto"]["column"] == "서브.오", str(st["auto"]))
+        check("웹 상태: 자동 선택 계정 닉네임을 함께 전달", st["auto"].get("nickname") == "오정원",
+              str(st["auto"]))
+        check("웹 상태 응답에 토큰 없음", "ntn_auto_probe" not in json.dumps(st, ensure_ascii=False))
+        check("웹 화면: '(자동 선택됨)' 표시 코드",
+              "(자동 선택됨)" in web_ui.PAGE_HTML and "auto.active" in web_ui.PAGE_HTML)
+
+        # 4-9) check_login() 이 실제 경로 — 로그인 상태를 읽으면 바로 자동 선택까지 한다
+        web_ui.reset_state()
+        web_ui.STATE["columns"] = list(cols)
+        main.login_state = lambda: login_of("이신엽", "ID …1234")
+        web_ui.save_column("서브.오")
+        state = web_ui.check_login()
+        check("check_login: 로그인 계정을 읽고", state.get("nickname") == "이신엽", str(state))
+        check("check_login: 담당자 열을 닉네임으로 자동 선택", secret()["column"] == "메인.엽", secret()["column"])
+        check("check_login: 상태에 자동 선택 정보가 실린다",
+              web_ui.api_status()["notion"]["auto"]["active"] is True, str(web_ui.api_status()["notion"]["auto"]))
+    finally:
+        for k, v in saved.items():
+            setattr(main, k, v)
+        web_ui.reset_state()
+        tmp.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     test_filter()
     test_apply_flow()
@@ -2167,6 +2358,7 @@ if __name__ == "__main__":
     test_logout()
     test_column_discovery()
     test_session_cache()
+    test_nickname_columns()
     cleanup()
     print()
     if FAILS:

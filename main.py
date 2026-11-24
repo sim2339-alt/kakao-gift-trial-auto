@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import difflib
 import http.cookiejar
 import json
 import os
@@ -1163,6 +1164,138 @@ def _participant_columns(properties: dict | None) -> list[str]:
         cols.append(name)
     cols.sort(key=lambda n: (0 if n == NOTION_DEFAULT_COLUMN else 1, n))
     return cols
+
+
+# ---------------------------------------------------------------------------
+# 3-D. 카카오 닉네임 ↔ 노션 담당자 열 자동 매칭
+#   노션 현황표의 담당자 열은 '메인.엽', '서브.오', '1팀.엽2(2200)' 처럼
+#   접두사(메인·서브·1팀·2군 …) + 핵심 이름 + (괄호 설명) 으로 되어 있다.
+#   카카오 로그인으로 읽은 닉네임(예: '이신엽', '오정원')을 그 핵심 이름과 비교해
+#   이번에 기록할 열을 사람이 고르지 않아도 되게 한다.
+# ---------------------------------------------------------------------------
+NOTION_COLUMN_SEPARATORS = (".", "·", "ㆍ", "・", "/", "|", "-", "_", ":", " ")
+NOTION_MAIN_PREFIX = "메인"   # 접두사가 같아 점수가 비길 때만 쓰는 아주 작은 가산점
+
+
+def notion_column_core(name: str) -> tuple[str, str]:
+    """담당자 열 이름 → (접두사, 핵심 이름).
+
+      '메인.엽'        → ('메인', '엽')
+      '서브.오'        → ('서브', '오')
+      '1팀.엽2(2200)'  → ('1팀', '엽2')      ← 괄호 안 설명은 이름이 아니다
+      '담당자'         → ('', '담당자')      ← 구분자가 없으면 열 이름 전체가 핵심
+    """
+    text = re.sub(r"\s+", " ", str(name or "")).strip()
+    if not text:
+        return "", ""
+    prefix, core = "", text
+    for sep in NOTION_COLUMN_SEPARATORS:
+        if sep in core:
+            head, tail = core.split(sep, 1)
+            if head.strip() and tail.strip():
+                prefix, core = head.strip(), tail.strip()
+                break
+    core = re.sub(r"\([^)]*\)|\[[^\]]*\]|\{[^}]*\}", "", core).strip()
+    return prefix, core or text
+
+
+def _same_name(text) -> str:
+    """비교용 이름 — 공백·대소문자 차이를 없앤다."""
+    return re.sub(r"\s+", "", str(text or "")).lower()
+
+
+def match_notion_column_detail(nickname, columns, account_id=None) -> dict:
+    """카카오 닉네임과 가장 잘 맞는 노션 담당자 열을 점수와 함께 고른다.
+
+    돌려주는 dict: {"column": str|None, "score": int, "core": str|None,
+                    "prefix": str|None, "reason": str, "nickname": str,
+                    "account_id": str|None, "candidates": [(score, 열), …]}
+      · score <= 0 (또는 후보 없음) 이면 column 은 None — 부르는 쪽이 기존 선택을 유지한다.
+
+    점수(높을수록 확실):
+      1000      열 이름과 완전 일치(공백·대소문자 무시)
+      900+      핵심 이름과 완전 일치            ('엽2' 닉네임 → '1팀.엽2')
+      860+      닉네임의 숫자를 뗀 값이 핵심 이름과 일치
+      800+      핵심 이름(2글자 이상)이 닉네임 안에 들어 있음 ('김수아' → '수아')
+      760+      닉네임이 핵심 이름 안에 들어 있음
+      600+      핵심 이름과 닉네임이 매우 비슷함(유사도 0.75 이상)
+      460~520   핵심 이름이 1글자 — 닉네임의 끝 글자(520) > 이름 첫 글자(500)
+                > 성씨(480) > 이름 가운데 글자(460). 한국 이름 2~5글자일 때만 본다.
+      접두사가 '메인'이면 같은 점수일 때 앞선다(+2).
+
+    account_id 는 매칭에 쓰지 않고 결과에 함께 담기만 한다(어느 계정으로 고른 값인지 기록용).
+    """
+    result = {"column": None, "score": 0, "core": None, "prefix": None, "reason": "",
+              "nickname": str(nickname or "").strip(), "account_id": account_id,
+              "candidates": []}
+    nick = _same_name(nickname)
+    if not nick:
+        result["reason"] = "카카오 계정 닉네임을 읽지 못했습니다."
+        return result
+    cols = [str(c).strip() for c in (columns or []) if str(c).strip()]
+    if not cols:
+        result["reason"] = "담당자 열 목록이 비어 있습니다."
+        return result
+
+    nick_digits_off = re.sub(r"\d+", "", nick) or nick
+    scored = []
+    for col in cols:
+        prefix, core_raw = notion_column_core(col)
+        core = _same_name(core_raw)
+        if not core:
+            continue
+        score, reason = 0, ""
+        if nick == _same_name(col):
+            score, reason = 1000, "열 이름과 완전히 같음"
+        elif nick == core:
+            score, reason = 900 + min(len(core), 9), f"핵심 이름 '{core_raw}'와 같음"
+        elif nick_digits_off == core:
+            score, reason = 860 + min(len(core), 9), f"숫자를 뺀 닉네임이 '{core_raw}'와 같음"
+        elif len(core) >= 2 and core in nick:
+            score, reason = 800 + min(len(core), 9), f"핵심 이름 '{core_raw}'가 닉네임에 들어 있음"
+        elif len(core) >= 2 and len(nick) >= 2 and nick in core:
+            score, reason = 760 + min(len(nick), 9), f"닉네임이 '{core_raw}'에 들어 있음"
+        elif len(core) >= 2 and len(nick) >= 2:
+            ratio = difflib.SequenceMatcher(None, core, nick_digits_off).ratio()
+            if ratio >= 0.75:
+                score, reason = 600 + int(ratio * 100), f"'{core_raw}'와 닮음(유사도 {ratio:.2f})"
+        if not score and len(core) == 1 and 2 <= len(nick_digits_off) <= 5 and core in nick_digits_off:
+            name_part = nick_digits_off[1:]          # 한국 이름: 첫 글자 = 성씨
+            if core == nick_digits_off[-1]:
+                score, reason = 520, f"'{core_raw}'가 닉네임 끝 글자와 같음"
+            elif core == name_part[:1]:
+                score, reason = 500, f"'{core_raw}'가 이름 첫 글자와 같음"
+            elif core == nick_digits_off[0]:
+                score, reason = 480, f"'{core_raw}'가 닉네임 첫 글자(성씨)와 같음"
+            elif core in name_part:
+                score, reason = 460, f"'{core_raw}'가 이름 가운데 글자와 같음"
+        if not score:
+            continue
+        if prefix == NOTION_MAIN_PREFIX:
+            score += 2                                # 점수가 같을 때만 순서가 바뀌는 정도
+        scored.append((score, col, core_raw, prefix, reason))
+
+    if not scored:
+        result["reason"] = (f"닉네임 '{result['nickname']}'와 비슷한 담당자 열을 찾지 못했습니다"
+                            f"(담당자 열 {len(cols)}개 확인).")
+        return result
+
+    scored.sort(key=lambda x: (-x[0], 0 if x[3] == NOTION_MAIN_PREFIX else 1, x[1]))
+    best = scored[0]
+    result.update({"column": best[1], "score": best[0], "core": best[2], "prefix": best[3],
+                   "reason": best[4],
+                   "candidates": [(s, c) for s, c, *_rest in scored[:3]]})
+    return result
+
+
+def match_notion_column_by_nickname(nickname, columns, account_id=None):
+    """카카오 닉네임으로 노션 담당자 열 이름을 고른다 — 확실한 후보가 없으면 None.
+
+    None 을 돌려주면 부르는 쪽은 저장된(직전에 고른) 열을 그대로 쓴다.
+    자세한 점수·이유가 필요하면 match_notion_column_detail() 을 쓴다.
+    """
+    detail = match_notion_column_detail(nickname, columns, account_id=account_id)
+    return detail.get("column") if detail.get("score", 0) > 0 else None
 
 
 def notion_columns_detail(db_id: str, token: str, transport=None) -> dict:

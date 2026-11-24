@@ -31,7 +31,7 @@ from pathlib import Path
 
 import main
 
-APP_VERSION = "2.5"
+APP_VERSION = "2.6"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 LOG_MAX = 4000          # 로그 창에 보관할 최대 줄 수
@@ -58,7 +58,11 @@ STATE = {
     "login_checked_at": None,
     "columns": None,         # 노션 참가자 열 목록(한 번 읽어 캐시)
     "columns_error": None,   # 열 목록을 못 읽은 사유(화면에 그대로 보여 준다)
+    "auto_column": None,     # 마지막 닉네임 자동 매칭 결과(적용·생략 사유까지)
 }
+
+
+_AUTO_LOCK = threading.Lock()   # notion_secret.json 의 _auto_column 기록을 고칠 때만 쓰는 잠금
 
 
 def reset_state():
@@ -67,7 +71,7 @@ def reset_state():
         STATE.update({"job": None, "console": [], "phase": "idle", "started_at": None,
                       "finished_at": None, "summary": None, "proc": None,
                       "login": None, "login_checked_at": None, "columns": None,
-                      "columns_error": None})
+                      "columns_error": None, "auto_column": None})
 
 
 def add_line(line: str):
@@ -173,6 +177,168 @@ def remember_column(column: str | None) -> None:
     column = (column or "").strip()
     if column:
         save_column(column)
+
+
+# ---------------------------------------------------------------------------
+# 1-B. 카카오 닉네임 → 노션 담당자 열 자동 선택
+#   로그인한 계정의 닉네임(예: 이신엽·오정원)과 비슷한 담당자 열(메인.엽·서브.오)을 찾아
+#   이번에 기록할 열을 자동으로 고른다.
+#   · 같은 계정을 쓰는 동안에는 사용자가 직접 고른 열을 덮어쓰지 않는다(_auto_column 기록).
+#   · 열 목록을 새로 읽었을 때는 '지정한 열이 사라졌거나 아직 자동 선택값 그대로'일 때만 다시 맞춘다.
+# ---------------------------------------------------------------------------
+AUTO_COLUMN_KEY = "_auto_column"   # notion_secret.json 에 남기는 자동 선택 기록(토큰·DB ID 와 별개)
+
+
+def _login_account(login: dict | None) -> dict:
+    """로그인 상태 dict → 계정 정보 dict(없으면 빈 dict)."""
+    account = (login or {}).get("account") if isinstance(login, dict) else None
+    return account if isinstance(account, dict) else {}
+
+
+def _login_nickname(login: dict | None) -> str:
+    return str(_login_account(login).get("nickname") or "").strip()
+
+
+def account_signature(login: dict | None) -> str | None:
+    """로그인 계정을 구분하는 짧은 지문 — 닉네임 + (가린) 계정 ID 끝 4자리.
+
+    닉네임이 같은 두 계정도 ID 끝 4자리로 구분된다(비밀번호·토큰은 들어가지 않는다).
+    """
+    account = _login_account(login)
+    nick = str(account.get("nickname") or "").strip()
+    key = str(account.get("masked_key") or "").strip()
+    if not nick and not key:
+        return None
+    return f"{nick}|{key}"
+
+
+def auto_column_record() -> dict:
+    """notion_secret.json 에 남은 마지막 자동 선택 기록(없으면 빈 dict)."""
+    rec = read_secret().get(AUTO_COLUMN_KEY)
+    return dict(rec) if isinstance(rec, dict) else {}
+
+
+def _write_auto_column(record: dict | None) -> bool:
+    """자동 선택 기록만 갱신한다(토큰·DB ID·column 등 다른 값은 그대로)."""
+    with _AUTO_LOCK:
+        data = read_secret()
+        if not data:
+            return False
+        if record:
+            data[AUTO_COLUMN_KEY] = dict(record)
+        else:
+            data.pop(AUTO_COLUMN_KEY, None)
+        return _write_secret(data) is None
+
+
+def mark_manual_column(column: str) -> None:
+    """사용자가 화면에서 직접 고른 열을 기록한다 — 같은 계정에서는 자동 선택이 덮어쓰지 않는다."""
+    column = (column or "").strip()
+    if not column:
+        return
+    with STATE["lock"]:
+        login = STATE.get("login")
+    record = {"account": account_signature(login) or "", "nickname": _login_nickname(login),
+              "column": column, "auto": False,
+              "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    if _write_auto_column(record):
+        with STATE["lock"]:
+            STATE["auto_column"] = record
+
+
+def _auto_column_info(current_column: str | None, login: dict | None) -> dict:
+    """화면에 보여 줄 자동 선택 상태 — 지금 담당자 열이 자동으로 고른 값인지(active).
+
+    active=true 면 화면이 열 이름 옆에 '(자동 선택됨)'을 붙이고, 툴팁으로 계정·이유를 보여 준다.
+    """
+    rec = auto_column_record()
+    if not rec:
+        return {"column": None, "nickname": None, "score": None, "auto": False,
+                "active": False, "note": None}
+    sig = account_signature(login)
+    col = rec.get("column") or None
+    active = bool(rec.get("auto") and col and current_column and col == str(current_column).strip()
+                  and (sig is None or not rec.get("account") or rec.get("account") == sig))
+    return {"column": col, "nickname": rec.get("nickname") or None, "score": rec.get("score"),
+            "auto": bool(rec.get("auto")), "active": active,
+            "note": rec.get("reason") if not rec.get("auto") else None}
+
+
+def apply_auto_column(login=None, columns=None, trigger: str = "login") -> dict | None:
+    """지금 로그인한 카카오 계정의 닉네임과 비슷한 담당자 열을 골라 저장한다.
+
+    trigger="login"   로그인을 새로 확인했을 때 — 같은 계정이 이미 기록에 있으면 아무것도 하지 않는다
+                      (그 사이 손으로 고른 열을 덮어쓰지 않기 위해서다).
+    trigger="columns" 담당자 열 목록을 새로 읽었을 때 — 저장된 열이 새 목록에 없거나,
+                      지금 열이 '자동으로 고른 값 그대로'일 때만 다시 맞춘다(손으로 고른 열은 유지).
+
+    돌려주는 값: {"ok", "column", "nickname", "score", "changed", "skipped"} ·
+                 로그인 전이거나 노션 설정이 없으면 None.
+    """
+    with STATE["lock"]:
+        login = login if isinstance(login, dict) else STATE.get("login")
+    if not isinstance(login, dict) or login.get("state") != "ok":
+        return None
+    cfg = main.load_notion_config()
+    if not cfg:
+        return None
+
+    nick = _login_nickname(login)
+    sig = account_signature(login)
+    current = str(cfg.get("column") or "").strip()
+    if columns is None:
+        cols = [str(c).strip() for c in (STATE.get("columns") or []) if str(c).strip()]
+        if not cols:
+            cols = [str(c).strip() for c in (cfg.get("columns") or []) if str(c).strip()]
+        if not cols:
+            cols = [c for c in (notion_columns() or []) if c]
+    else:
+        cols = [str(c).strip() for c in columns if str(c).strip()]
+
+    def done(**kw) -> dict:
+        out = {"ok": True, "column": current, "nickname": nick, "score": 0,
+               "changed": False, "skipped": None}
+        out.update(kw)
+        with STATE["lock"]:
+            STATE["auto_column"] = {**out, "account": sig, "trigger": trigger}
+        return out
+
+    rec = auto_column_record()
+    if trigger == "login":
+        if rec.get("account") and rec.get("account") == sig:
+            return done(skipped="같은 계정 — 열을 다시 맞추지 않습니다(손으로 고른 열 보호)",
+                        column=current or (rec.get("column") or None))
+    else:
+        still_auto = bool(rec.get("auto")) and str(rec.get("column") or "") == current
+        if current and current in cols and not still_auto:
+            return done(skipped="저장된 열을 그대로 둡니다(직접 고른 열)")
+    if not nick:
+        return done(skipped="카카오 계정 닉네임을 읽지 못해 저장된 열을 그대로 씁니다")
+    if not cols:
+        return done(skipped="담당자 열 목록을 읽지 못해 저장된 열을 그대로 씁니다")
+
+    detail = main.match_notion_column_detail(nick, cols, account_id=sig)
+    column = detail.get("column")
+    if not column:
+        add_line(f"[자동 선택] 카카오 계정 '{nick}' — {detail.get('reason') or '맞는 담당자 열 없음'}"
+                 + (f" 저장된 열 '{current}'을(를) 그대로 씁니다." if current else ""))
+        _write_auto_column({"account": sig or "", "nickname": nick, "column": None,
+                            "auto": False, "score": 0, "reason": detail.get("reason"),
+                            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+        return done(skipped=detail.get("reason") or "맞는 담당자 열 없음")
+
+    changed = column != current
+    if changed:
+        if not save_column(column):
+            return done(skipped="열을 저장하지 못했습니다(notion_secret.json 확인)")
+        add_line(f"[자동 선택] 카카오 계정 '{nick}' → 담당자 열 '{column}' 로 바꿨습니다"
+                 f"(점수 {detail.get('score')} · {detail.get('reason')}).")
+    record = {"account": sig or "", "nickname": nick, "column": column, "auto": True,
+              "score": detail.get("score"),
+              "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    if not _write_auto_column(record):
+        add_line("[안내] 자동 선택 결과를 notion_secret.json 에 기록하지 못했습니다(다음에 다시 맞춥니다).")
+    return done(column=column, score=detail.get("score"), changed=changed)
 
 
 def _public_databases(entries, current_id: str = "") -> list:
@@ -302,6 +468,10 @@ def save_notion_settings(token: str, db_id: str = "", column: str = "") -> dict:
         add_line(f"[경고] {STATE['columns_error']}")
     if raw_db and raw_db != db_id:
         add_line(f"[설정] 붙여넣은 주소에서 DB ID 만 추출했습니다: {db_id}")
+    if cols:
+        auto = apply_auto_column(columns=cols, trigger="columns")
+        if auto and auto.get("changed") and auto.get("column"):
+            col = auto["column"]
     return {"ok": True, "column": col, "columns": list(STATE["columns"] or []),
             "columns_error": STATE["columns_error"],
             "databases": _public_databases(data.get("_databases"), db_id),
@@ -337,6 +507,10 @@ def switch_notion_db(db_id: str) -> dict:
     title = next((str(d.get("title")) for d in (data.get("_databases") or [])
                   if main.normalize_notion_db_id((d or {}).get("id")) == new_id), "")
     add_line(f"[설정] 노션 DB 를 바꿨습니다: {title or new_id[-6:]} · 담당자 열 {len(cols)}개")
+    if cols:
+        auto = apply_auto_column(columns=cols, trigger="columns")
+        if auto and auto.get("changed") and auto.get("column"):
+            col = auto["column"]
     return {"ok": True, "db_id": new_id, "column": col, "columns": list(cols),
             "columns_error": err, "databases": _public_databases(data.get("_databases"), new_id)}
 
@@ -382,8 +556,13 @@ def refresh_databases() -> dict:
             STATE["columns"] = cols
             STATE["columns_error"] = None
     add_line(f"[설정] 노션 DB 목록 새로고침 — {len(databases)}개" + (f" · {note}" if note else ""))
+    column = data.get("column")
+    if cur and STATE.get("columns"):
+        auto = apply_auto_column(columns=STATE["columns"], trigger="columns")
+        if auto and auto.get("changed") and auto.get("column"):
+            column = auto["column"]
     return {"ok": True, "databases": databases, "count": len(databases), "note": note,
-            "columns": list(STATE["columns"] or []), "column": data.get("column"),
+            "columns": list(STATE["columns"] or []), "column": column,
             "columns_error": STATE.get("columns_error")}
 
 
@@ -436,17 +615,21 @@ def reload_columns() -> dict:
     cols = notion_columns(force=True)
     err = STATE.get("columns_error")
     add_line(f"[설정] 담당자 열 새로고침 — {len(cols)}개" + (f" ({err})" if err else ""))
+    if cols:
+        apply_auto_column(columns=cols, trigger="columns")   # 열 이름이 바뀌었으면 다시 맞춘다
     return {"ok": not err, "columns": list(cols),
             "column": (main.load_notion_config() or {}).get("column"),
             "error": err}
 
 
 def check_login() -> dict:
-    """로그인 상태 + 지금 로그인된 계정 닉네임을 읽어 화면 상태에 넣는다."""
+    """로그인 상태 + 지금 로그인된 계정 닉네임을 읽어 화면 상태에 넣는다(닉네임으로 담당자 열 자동 선택)."""
     state = main.login_state()
     with STATE["lock"]:
         STATE["login"] = state
         STATE["login_checked_at"] = now_text()
+    if state.get("state") == "ok":
+        apply_auto_column(login=state, trigger="login")
     return state
 
 
@@ -507,6 +690,7 @@ def api_status() -> dict:
     with STATE["lock"]:
         login = STATE["login"]
         checked_at = STATE["login_checked_at"]
+    notion["auto"] = _auto_column_info(notion["column"], login)
     if login is None:
         login = {"state": "unknown", "detail": "아직 확인하지 않았습니다."}
     job = log_payload(0)
@@ -850,7 +1034,10 @@ class Handler(BaseHTTPRequestHandler):
                         "removed": r.get("removed"), "cookies": r.get("cookies"),
                         "error": r.get("error")})
         elif path == "/api/column":
-            self._json(save_column(payload.get("column") or ""))
+            r = save_column(payload.get("column") or "")
+            if r.get("ok"):
+                mark_manual_column(r.get("column") or payload.get("column") or "")   # 손으로 고른 열은 자동 선택이 덮어쓰지 않는다
+            self._json(r)
         elif path == "/api/notion-setup":
             self._json(save_notion_settings(payload.get("token") or "",
                                             payload.get("db_id") or "",
@@ -1000,7 +1187,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
       <button class="btn" id="btnLogout">카카오 로그아웃</button>
     </div>
   </header>
-  <p class="hint" style="margin:-8px 0 16px">한 화면에서 끝납니다 — ① [카카오 로그인 창 열기](처음 한 번) → ② 기록할 담당자 열 선택 → ③ [후보 목록 불러오기] → ④ [자동 신청 시작]</p>
+  <p class="hint" style="margin:-8px 0 16px">한 화면에서 끝납니다 — ① [카카오 로그인 창 열기](처음 한 번) → ② 기록할 담당자 열(닉네임과 비슷한 열은 자동 선택) → ③ [후보 목록 불러오기] → ④ [자동 신청 시작]</p>
 
   <section class="card">
     <h2>노션 연동 <span class="muted" id="notionSavedNote" style="font-weight:400;text-transform:none;letter-spacing:0"></span></h2>
@@ -1013,7 +1200,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
         </span>
       </label>
     </div>
-    <p class="hint" id="columnHint">노션 토큰·DB ID 는 <b>한 번 저장하면 다시 묻지 않습니다.</b> 이번 실행에서 <b>어느 담당자 열에 기록할지</b>만 고르면 됩니다. 고른 열은 다음 실행의 기본값으로 기억됩니다.</p>
+    <p class="hint" id="columnHint">노션 토큰·DB ID 는 <b>한 번 저장하면 다시 묻지 않습니다.</b> 이번 실행에서 <b>어느 담당자 열에 기록할지</b>만 고르면 됩니다. 고른 열은 다음 실행의 기본값으로 기억됩니다. <b>카카오 로그인 계정 이름(닉네임)과 비슷한 담당자 열은 자동으로 골라집니다.</b></p>
     <div class="banner" id="columnBanner"></div>
     <details class="admin" id="notionAdmin">
       <summary>⚙ 설정 변경 (토큰·DB ID — 처음 한 번만 / 거의 쓸 일 없음)</summary>
@@ -1116,6 +1303,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
 
 <script>
 const $ = (id) => document.getElementById(id);
+const COLUMN_HINT_DEFAULT = "노션 토큰·DB ID 는 <b>한 번 저장하면 다시 묻지 않습니다.</b> 이번 실행에서 <b>어느 담당자 열에 기록할지</b>만 고르면 됩니다. 고른 열은 다음 실행의 기본값으로 기억됩니다.";
 let mode = "notion";
 let logSince = 0;
 let busy = false;
@@ -1181,21 +1369,37 @@ async function refreshStatus(){
   const sel = $("column");
   const cols = n.columns || [];
   const want = n.column || "";
+  const auto = n.auto || {};
+  const autoCol = auto.active ? (auto.column || "") : "";
   if(cols.length){
     const names = cols.slice();
     if(want && !names.includes(want)) names.unshift(want);
-    const sig = names.join("|");
+    const sig = names.join("|") + "#" + autoCol;
     if(sel.dataset.sig !== sig){
       sel.dataset.sig = sig;
-      sel.innerHTML = names.map(x => `<option value="${esc(x)}">${esc(x)}</option>`).join("");
+      sel.innerHTML = names.map(x => `<option value="${esc(x)}">${esc(x)}${x === autoCol ? " (자동 선택됨)" : ""}</option>`).join("");
     }
     if(want) sel.value = want;
-    sel.title = `담당자 열 ${cols.length}개`;
+    sel.title = `담당자 열 ${cols.length}개` + (autoCol
+      ? ` · 카카오 계정 '${auto.nickname || ""}' 닉네임으로 자동 선택`
+      : "");
   } else if(want && sel.dataset.sig !== want){
     sel.dataset.sig = want;
     sel.innerHTML = `<option value="${esc(want)}">${esc(want)}</option>`;
     sel.value = want;
     sel.title = "노션에서 열 목록을 읽지 못해 저장된 열 1개만 표시 중";
+  }
+  /* 닉네임으로 담당자 열을 자동으로 골랐으면 열 이름 옆·아래에 짧게 알린다 */
+  const hint = $("columnHint");
+  if(autoCol){
+    hint.innerHTML = `카카오 계정 <b>'${esc(auto.nickname || "")}'</b> 닉네임과 비슷해 <b>'${esc(autoCol)}'</b> 열을 자동으로 골랐습니다. 다른 열을 직접 고르면 그 열을 기억하고, 같은 계정을 쓰는 동안에는 자동 선택이 덮어쓰지 않습니다.`;
+    hint.dataset.auto = "1";
+  } else if(auto.note){
+    hint.innerHTML = `${esc(auto.note)} — 저장된 열 <b>'${esc(want)}'</b>을(를) 그대로 씁니다.`;
+    hint.dataset.auto = "1";
+  } else if(hint.dataset.auto === "1"){
+    hint.innerHTML = COLUMN_HINT_DEFAULT;
+    hint.dataset.auto = "";
   }
   /* 열 목록을 못 읽었으면 이유를 숨기지 않고 그대로 보여 준다(1개만 뜨는 원인) */
   const colErr = n.columns_error || "";
