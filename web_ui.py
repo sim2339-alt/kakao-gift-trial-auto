@@ -1281,7 +1281,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
       <button class="btn" id="btnLogout">카카오 로그아웃</button>
     </div>
   </header>
-  <p class="hint" style="margin:-8px 0 16px">한 화면에서 끝납니다 — ① [카카오 로그인 창 열기](처음 한 번) → ② 기록할 담당자 열(닉네임과 비슷한 열은 자동 선택) → ③ [후보 목록 불러오기] → ④ [자동 신청 시작]</p>
+  <p class="hint" style="margin:-8px 0 16px">한 화면에서 끝납니다 — ① [카카오 로그인 아이디] 고르고 [카카오 로그인 창 열기](처음 한 번 · 아이디는 미리 채워짐) → ② 기록할 담당자 열(닉네임과 비슷한 열은 자동 선택) → ③ [후보 목록 불러오기] → ④ [자동 신청 시작]</p>
 
   <section class="card">
     <h2>카카오 로그인 아이디 <span class="muted" id="accountsNote" style="font-weight:400;text-transform:none;letter-spacing:0"></span></h2>
