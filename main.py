@@ -103,6 +103,14 @@ LOGIN_ID_SELECTORS = (
     'input[type="email"]',
     'input[type="text"]',
 )
+# 아이디를 채운 직후 커서(포커스)를 옮길 비밀번호 칸 — 마우스 없이 바로 키보드로 입력하기
+LOGIN_PASSWORD_SELECTORS = (
+    'input[name="password"]',
+    'input#password--2',
+    'input#password',
+    'input[type="password"]',
+    'input[autocomplete="current-password"]',
+)
 
 # 목록 API 정렬은 CREATED_AT만 허용된다.
 # sortProperty=APPLY_COUNT 는 서버가 HTTP 400 을 돌려주므로, 인기순은 받아온 뒤 로컬에서 정렬한다.
@@ -1820,6 +1828,38 @@ def _verify_mobile_session(p) -> tuple:
             pass
 
 
+def _focus_login_password(page) -> bool:
+    """로그인 창의 비밀번호 입력칸으로 커서를 옮긴다(비밀번호 입력·클릭 제출은 하지 않음).
+
+    아이디를 fill() 한 직후 불러, 사용자가 마우스 없이 바로 비밀번호를 치고 Enter 로 로그인하도록 돕는다.
+    화면 개편에 대비해 셀렉터를 차례로 시도하고, DOM focus() 가 막히면 칸을 한 번 눌러 커서를 넣는다.
+    포커스는 편의 기능이므로 어떤 경우에도 예외를 밖으로 던지지 않는다(실패해도 로그인 흐름은 그대로).
+    """
+    for sel in LOGIN_PASSWORD_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            if not _visible(loc):
+                continue
+            try:
+                loc.focus(timeout=2000)
+                return True
+            except Exception:
+                pass
+            try:                       # Playwright focus 가 막히면 페이지 안에서 직접 focus()
+                loc.evaluate("el => el.focus()")
+                return True
+            except Exception:
+                pass
+            try:
+                loc.click(timeout=2000)    # 마지막 폴백 — 칸을 눌러 커서를 넣는다
+                return True
+            except Exception:
+                continue
+        except Exception:
+            continue
+    return False
+
+
 def _fill_login_id(page, login_id: str, wait_seconds: float = LOGIN_ID_FILL_WAIT_SECONDS) -> bool:
     """로그인 창의 아이디 입력칸에 login_id 를 미리 채운다(비밀번호는 채우지 않음).
 
@@ -1842,7 +1882,11 @@ def _fill_login_id(page, login_id: str, wait_seconds: float = LOGIN_ID_FILL_WAIT
                     continue
                 loc.fill(login_id, timeout=3000)
                 print(f"[로그인] 저장된 아이디를 미리 채웠습니다: {login_id}")
-                print("         비밀번호만 입력하고 [로그인]을 눌러 주세요(비밀번호는 저장하지 않습니다).")
+                if _focus_login_password(page):
+                    print("         커서를 비밀번호 칸으로 옮겼습니다 — 마우스 없이 비밀번호만 치고 Enter "
+                          "(비밀번호는 저장하지 않습니다).")
+                else:
+                    print("         비밀번호만 입력하고 [로그인]을 눌러 주세요(비밀번호는 저장하지 않습니다).")
                 return True
             except Exception:
                 continue          # 다음 셀렉터로 넘어간다(화면 개편·일시 렌더링 실패 대비)
@@ -1896,7 +1940,8 @@ def run_login(mode: str = "desktop", login_id: str = "") -> int:
         print("=" * 68)
         login_id = (login_id or "").strip()
         if login_id:
-            print(f"  로그인 아이디 '{login_id}' 를 아이디 칸에 미리 채웁니다. 비밀번호만 입력하세요.")
+            print(f"  로그인 아이디 '{login_id}' 를 아이디 칸에 미리 채우고, 커서를 비밀번호 칸으로 옮깁니다.")
+            print("  → 마우스 없이 비밀번호만 치고 Enter 를 누르면 됩니다.")
         print(f"  로그인 주소: {login_url}")
         print()
         try:

@@ -31,7 +31,7 @@ from pathlib import Path
 
 import main
 
-APP_VERSION = "2.7"
+APP_VERSION = "2.8"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 LOG_MAX = 4000          # 로그 창에 보관할 최대 줄 수
@@ -1266,6 +1266,27 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .banner.show{display:block}
   .banner.err{background:var(--bad-bg);color:var(--bad)}
   .banner.info{background:var(--ok-bg);color:var(--ok)}
+  /* 로그인 아이디 선택 팝업 */
+  .modal-back{position:fixed;inset:0;background:rgba(16,24,40,.45);display:none;z-index:50;padding:18px;
+        align-items:center;justify-content:center}
+  .modal{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);
+        width:100%;max-width:520px;max-height:86vh;padding:18px;display:flex;flex-direction:column}
+  .modal h3{margin:0;font-size:16px;letter-spacing:-.1px}
+  .modal h3:focus{outline:none}
+  .modal .hint{margin:7px 0 0}
+  .modal-list{display:flex;flex-direction:column;gap:8px;margin:14px 0;overflow:auto;flex:1 1 auto}
+  .modal-list:empty::before{content:"저장된 아이디가 없습니다.";color:var(--muted);font-size:13px}
+  button.acct{display:flex;align-items:center;gap:10px;width:100%;text-align:left;font:inherit;font-size:14px;
+        color:var(--text);background:var(--bg);border:1px solid var(--line);border-radius:12px;
+        padding:11px 12px;cursor:pointer;transition:.12s}
+  button.acct:hover{border-color:var(--muted)}
+  button.acct.on{border-color:var(--accent);outline:2px solid var(--accent);outline-offset:-1px;font-weight:600}
+  button.acct .k{flex:0 0 auto;min-width:19px;height:19px;border-radius:6px;background:var(--line);color:var(--muted);
+        font-size:11.5px;line-height:19px;text-align:center;font-variant-numeric:tabular-nums}
+  button.acct.on .k{background:var(--accent);color:var(--accent-ink);font-weight:700}
+  button.acct .who{flex:1 1 auto;word-break:break-all}
+  .modal-foot{display:flex;flex-wrap:wrap;gap:8px;justify-content:space-between;
+        border-top:1px solid var(--line);padding-top:12px}
   footer{color:var(--muted);font-size:12px;text-align:center;margin-top:22px}
   @media (max-width:640px){.wrap{padding:16px 12px 48px}h1{font-size:18px}.card{padding:14px}}
 </style>
@@ -1281,7 +1302,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
       <button class="btn" id="btnLogout">카카오 로그아웃</button>
     </div>
   </header>
-  <p class="hint" style="margin:-8px 0 16px">한 화면에서 끝납니다 — ① [카카오 로그인 아이디] 고르고 [카카오 로그인 창 열기](처음 한 번 · 아이디는 미리 채워짐) → ② 기록할 담당자 열(닉네임과 비슷한 열은 자동 선택) → ③ [후보 목록 불러오기] → ④ [자동 신청 시작]</p>
+  <p class="hint" style="margin:-8px 0 16px">한 화면에서 끝납니다 — ① [카카오 로그인 창 열기]를 누르고 <b>팝업에서 아이디를 고르면</b> 로그인 창이 열립니다(처음 한 번 · 아이디는 미리 채워지고 비밀번호 칸으로 커서 이동 — 비밀번호만 치고 Enter) → ② 기록할 담당자 열(닉네임과 비슷한 열은 자동 선택) → ③ [후보 목록 불러오기] → ④ [자동 신청 시작]</p>
 
   <section class="card">
     <h2>카카오 로그인 아이디 <span class="muted" id="accountsNote" style="font-weight:400;text-transform:none;letter-spacing:0"></span></h2>
@@ -1292,7 +1313,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
       <button class="btn" id="btnReloadAccounts" type="button">↻ 메모장 불러오기</button>
       <button class="btn" id="btnEditAccounts" type="button">📝 메모장 편집</button>
     </div>
-    <p class="hint" id="accountsHint">메모장(<code>accounts.txt</code>)에 <b>한 줄에 하나씩</b> 카카오 로그인 아이디를 적어 두면 여기서 골라 쓸 수 있고, <b>[카카오 로그인 창 열기] 때 아이디 칸에 미리 채워집니다.</b> 비밀번호는 채우지도 저장하지도 않습니다.</p>
+    <p class="hint" id="accountsHint">메모장(<code>accounts.txt</code>)에 <b>한 줄에 하나씩</b> 카카오 로그인 아이디를 적어 두면 여기서 골라 쓸 수 있고, <b>[카카오 로그인 창 열기]를 누르면 팝업에서 골라 바로 열 수 있습니다</b>(↑/↓·1~9·Enter=열기, Esc=닫기). 고른 아이디는 로그인 화면 <b>아이디 칸에 미리 채워지고 커서는 비밀번호 칸으로 이동</b>합니다 — 마우스 없이 비밀번호만 치고 Enter. 비밀번호는 채우지도 저장하지도 않습니다.</p>
     <div class="banner" id="accountsBanner"></div>
     <div id="accountsEditor" style="display:none">
       <p class="hint" style="margin-top:12px">한 줄에 하나씩: <code>아이디</code> 또는 <code>별명 | 아이디</code> · <code>#</code> 뒤는 주석으로 무시합니다.</p>
@@ -1424,6 +1445,20 @@ PAGE_HTML = r"""<!DOCTYPE html>
   <footer>이 화면은 이 PC 안에서만 열립니다 · 외부 전송 없음 · <span id="foot">표준 라이브러리만 사용</span></footer>
 </div>
 
+<!-- 로그인 아이디 선택 팝업: [카카오 로그인 창 열기]를 누르면 저장된 아이디를 여기서 고른다 -->
+<div class="modal-back" id="loginModal" role="dialog" aria-modal="true" aria-labelledby="loginModalTitle">
+  <div class="modal">
+    <h3 id="loginModalTitle" tabindex="-1">카카오 로그인 아이디 선택
+      <span class="muted" id="loginModalCount" style="font-weight:400;font-size:13px"></span></h3>
+    <p class="hint">클릭하거나 <b>↑</b>/<b>↓</b> 이동 · <b>1~9</b> 바로 선택 · <b>Enter</b> 열기 · <b>Esc</b> 닫기</p>
+    <div class="modal-list" id="loginModalList"></div>
+    <div class="modal-foot">
+      <button class="btn" id="btnLoginNoId" type="button">(아이디 입력 없이 그냥 열기)</button>
+      <button class="btn" id="btnLoginModalClose" type="button">닫기</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 const COLUMN_HINT_DEFAULT = "노션 토큰·DB ID 는 <b>한 번 저장하면 다시 묻지 않습니다.</b> 이번 실행에서 <b>어느 담당자 열에 기록할지</b>만 고르면 됩니다. 고른 열은 다음 실행의 기본값으로 기억됩니다.";
@@ -1514,6 +1549,100 @@ async function loadAccounts(quiet){
       ? `메모장에서 아이디 ${r.count}개를 불러왔습니다. (${r.name || "accounts.txt"})`
       : "accounts.txt 가 아직 없습니다. [📝 메모장 편집]으로 아이디를 적고 저장하면 다음부터 골라 쓸 수 있습니다.", "info");
   }
+}
+
+/* ── 로그인 아이디 선택 팝업(모달) ─────────────────── */
+let modalItems = [];        /* 지금 팝업에 뜬 아이디 [{id, label}] */
+let modalSel = 0;           /* 키보드로 고른 자리 */
+let modalOpen = false;
+
+function accountPickerItems(){
+  /* 상단 <select> 와 같은 순서·같은 목록을 만든다 */
+  const saved = lsGet(LOGIN_ID_KEY, null);
+  const known = accounts.some(a => a.account === (saved || ""));
+  const list = [];
+  if(saved && !known) list.push({id: saved, label: saved});
+  accounts.forEach(a => list.push({id: a.account, label: (a.label ? a.label + " · " : "") + a.account}));
+  return list;
+}
+
+function renderLoginModal(){
+  $("loginModalCount").textContent = modalItems.length ? "· " + modalItems.length + "개" : "";
+  $("loginModalList").innerHTML = modalItems.map((it, i) =>
+    '<button type="button" class="acct' + (i === modalSel ? " on" : "") + '" data-idx="' + i + '">'
+    + '<span class="k">' + (i + 1) + '</span><span class="who">' + esc(it.label) + '</span></button>').join("");
+}
+
+function openLoginModal(){
+  const items = accountPickerItems();
+  if(!items.length) return false;          /* 저장된 아이디가 없으면 팝업 없이 그냥 연다 */
+  modalItems = items;
+  const at = items.findIndex(it => it.id === ($("loginId").value || ""));
+  modalSel = at >= 0 ? at : 0;
+  renderLoginModal();
+  $("loginModal").style.display = "flex";
+  modalOpen = true;
+  try{ $("loginModalTitle").focus(); }catch(e){}
+  return true;
+}
+
+function closeLoginModal(){
+  modalOpen = false;
+  $("loginModal").style.display = "none";
+  try{ $("btnLogin").focus(); }catch(e){}
+}
+
+async function pickLoginItem(i){
+  if(i < 0 || i >= modalItems.length) return;
+  const id = modalItems[i].id;
+  modalSel = i;
+  $("loginId").value = id;        /* 상단 목록도 같은 아이디로 맞춘다 */
+  lsSet(LOGIN_ID_KEY, id);
+  closeLoginModal();
+  await doLogin(id);
+}
+
+/* 팝업이 열려 있을 때만 개입하는 키보드 도우미 */
+function loginModalKey(ev){
+  if(!modalOpen) return false;
+  const k = (ev && ev.key) || "";
+  const stop = () => { try{ ev.preventDefault(); }catch(e){} };
+  if(k === "Escape"){ stop(); closeLoginModal(); return true; }
+  if(!modalItems.length) return false;
+  if(k === "ArrowDown" || k === "ArrowUp"){
+    stop();
+    modalSel = (modalSel + (k === "ArrowDown" ? 1 : -1) + modalItems.length) % modalItems.length;
+    renderLoginModal();
+    return true;
+  }
+  if(k === "Enter"){ stop(); pickLoginItem(modalSel); return true; }
+  if(/^[1-9]$/.test(k)){
+    const n = Number(k) - 1;
+    if(n < modalItems.length){ stop(); modalSel = n; renderLoginModal(); return true; }
+  }
+  return false;
+}
+document.addEventListener("keydown", loginModalKey);
+
+async function doLogin(loginId){
+  const btn = $("btnLogin");
+  btn.disabled = true;
+  try{
+    const r = await api("/api/login", { login_id: loginId });
+    const msg = r.ok
+      ? "로그인 창을 열었습니다. PC 화면의 크롬 창에서 로그인을 끝까지 마쳐 주세요."
+        + (r.login_id ? ` 아이디 '${r.login_id}' 는 미리 채워 두고 커서를 비밀번호 칸으로 옮깁니다 — 비밀번호만 치고 Enter.` : "")
+      : r.error;
+    banner($("runBanner"), msg, r.ok ? "info" : "err");
+    return r;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function openLoginFlow(){
+  if(openLoginModal()) return;      /* 저장된 아이디가 있으면 팝업에서 고른다 */
+  await doLogin($("loginId").value || "");
 }
 
 /* ── 완료 알람 (크롬 알림 · 알림음 · 제목 점멸) ─────── */
@@ -1815,15 +1944,17 @@ $("limit").addEventListener("input", syncLimitChips);
 $("btnPreview").onclick = loadPreview;
 $("btnStart").onclick = startRun;
 $("btnStop").onclick = stopRun;
-$("btnLogin").onclick = async () => {
-  const loginId = $("loginId").value || "";
-  const r = await api("/api/login", { login_id: loginId });
-  const msg = r.ok
-    ? "로그인 창을 열었습니다. PC 화면의 크롬 창에서 로그인을 끝까지 마쳐 주세요."
-      + (r.login_id ? ` 아이디 '${r.login_id}' 는 미리 채워 둠 — 비밀번호만 입력하세요.` : "")
-    : r.error;
-  banner($("runBanner"), msg, r.ok ? "info" : "err");
-};
+$("btnLogin").onclick = openLoginFlow;
+$("btnLoginModalClose").onclick = () => closeLoginModal();
+$("btnLoginNoId").onclick = () => { closeLoginModal(); doLogin(""); };
+$("loginModalList").addEventListener("click", (e) => {
+  const b = (e.target && e.target.closest) ? e.target.closest("button[data-idx]") : null;
+  if(!b) return;
+  pickLoginItem(Number(b.dataset.idx));
+});
+$("loginModal").addEventListener("click", (e) => {
+  if(e.target === $("loginModal")) closeLoginModal();   /* 어두운 바깥을 누르면 닫기 */
+});
 $("btnLogout").onclick = async () => {
   if(!confirm("카카오 로그아웃할까요?\n저장된 로그인 세션을 지웁니다(다른 계정으로 다시 로그인할 수 있습니다).")) return;
   $("btnLogout").disabled = true;

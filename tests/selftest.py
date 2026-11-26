@@ -2477,11 +2477,32 @@ def test_accounts_alarm():
                 raise RuntimeError("fill 실패")
             self.page.filled.append((self.sel, value))
 
+        def focus(self, timeout=None):
+            if self.page.focus_error:
+                raise RuntimeError("focus 실패")
+            self.page.focused.append(self.sel)
+
+        def evaluate(self, js):
+            if self.page.dom_focus_error:
+                raise RuntimeError("evaluate 실패")
+            self.page.focused.append(("dom", self.sel))
+
+        def click(self, timeout=None):
+            if self.page.click_error:
+                raise RuntimeError("click 실패")
+            self.page.clicked.append(self.sel)
+
     class FillPage:
-        def __init__(self, hidden=(), fill_error=False, appears_after=0):
+        def __init__(self, hidden=(), fill_error=False, appears_after=0,
+                     focus_error=False, dom_focus_error=False, click_error=False):
             self.hidden = set(hidden)
             self.fill_error = fill_error
+            self.focus_error = focus_error
+            self.dom_focus_error = dom_focus_error
+            self.click_error = click_error
             self.filled = []
+            self.focused = []
+            self.clicked = []
             self.waits = 0
             self.appears_after = appears_after
             if appears_after:
@@ -2519,6 +2540,41 @@ def test_accounts_alarm():
     main._fill_login_id(page, "pw-test")
     check("아이디 채우기: 비밀번호 칸은 건드리지 않는다",
           all("password" not in sel.lower() for sel, _ in page.filled), str(page.filled))
+
+    # 5-1) 비밀번호 칸 자동 포커스 — 마우스 없이 바로 키보드로
+    check("비밀번호 포커스: 셀렉터 목록(name·#password--2·type·autocomplete)",
+          main.LOGIN_PASSWORD_SELECTORS[:2] == ('input[name="password"]', 'input#password--2')
+          and 'input[type="password"]' in main.LOGIN_PASSWORD_SELECTORS
+          and 'input[autocomplete="current-password"]' in main.LOGIN_PASSWORD_SELECTORS,
+          str(main.LOGIN_PASSWORD_SELECTORS))
+    page = FillPage()
+    main._fill_login_id(page, "mom@kakao.com")
+    check("비밀번호 포커스: 아이디를 채운 직후 비밀번호 칸으로 커서",
+          page.focused and page.focused[0] == main.LOGIN_PASSWORD_SELECTORS[0], str(page.focused))
+    check("비밀번호 포커스: 비밀번호 값을 넣거나 제출하지 않는다",
+          page.filled == [('input[name="loginId"]', "mom@kakao.com")], str(page.filled))
+    page = FillPage(hidden={'input[name="password"]'})
+    main._fill_login_id(page, "mom@kakao.com")
+    check("비밀번호 포커스: 첫 셀렉터가 없으면 다음 셀렉터로 폴백",
+          page.focused and page.focused[0] == 'input#password--2', str(page.focused))
+    page = FillPage(focus_error=True)
+    main._fill_login_id(page, "mom@kakao.com")
+    check("비밀번호 포커스: focus() 가 막히면 페이지 안에서 직접 focus()",
+          ("dom", 'input[name="password"]') in page.focused, str(page.focused))
+    page = FillPage(focus_error=True, dom_focus_error=True)
+    main._fill_login_id(page, "mom@kakao.com")
+    check("비밀번호 포커스: 둘 다 막히면 칸을 한 번 눌러 커서를 넣는다",
+          page.clicked == ['input[name="password"]'], str(page.clicked))
+    page = FillPage(focus_error=True, dom_focus_error=True, click_error=True)
+    ok_all_fail = main._fill_login_id(page, "mom@kakao.com")
+    check("비밀번호 포커스: 모두 실패해도 예외 없이 로그인 흐름은 계속",
+          ok_all_fail is True and page.filled == [('input[name="loginId"]', "mom@kakao.com")], str(page.filled))
+    page = FillPage(hidden=main.LOGIN_PASSWORD_SELECTORS)
+    check("비밀번호 포커스: 비밀번호 칸이 없으면 조용히 False",
+          main._focus_login_password(page) is False and page.focused == [])
+    page = FillPage()
+    main._fill_login_id(page, "")
+    check("비밀번호 포커스: 아이디가 없으면 포커스도 하지 않는다", page.focused == [], str(page.focused))
 
     # 6) CLI 배선 — --login --login-id 가 run_login 으로 전달되는지
     saved_run_login = main.run_login
@@ -2563,6 +2619,18 @@ def test_accounts_alarm():
           "function flashTitle" in html and "function stopFlashTitle" in html and "visibilitychange" in html, "")
     check("웹 화면: 실행 중→끝남 전이에서만 알린다(중복 방지)",
           "prevRunning === true" in html and "lastNotifiedFinish" in html, "")
+    check("웹 화면: 로그인 아이디 선택 팝업(모달) · 목록 · 닫기 · 아이디 없이 열기",
+          'id="loginModal"' in html and 'id="loginModalList"' in html
+          and 'id="btnLoginModalClose"' in html and 'id="btnLoginNoId"' in html, "")
+    check("웹 화면: 팝업 키보드 지원(↑/↓·1~9·Enter·Esc)",
+          "loginModalKey" in html and "ArrowDown" in html and "Escape" in html
+          and 'k === "Enter"' in html and "/^[1-9]$/" in html, "")
+    check("웹 화면: 팝업에서 고르면 그 아이디로 로그인",
+          "pickLoginItem(modalSel)" in html and "if(openLoginModal()) return" in html, "")
+    check("웹 화면: 저장된 아이디가 없으면 팝업 없이 그냥 연다",
+          "if(!items.length) return false" in html, "")
+    check("웹 화면: 비밀번호 칸 커서 이동 안내",
+          ("커서를 비밀번호 칸으로" in html) and ("커서는 비밀번호 칸으로 이동" in html), "")
     used_ids = set(re.findall(r'\$\("([A-Za-z0-9_-]+)"\)', html))
     defined_ids = set(re.findall(r'id="([A-Za-z0-9_-]+)"', html))
     check("웹 화면: 스크립트가 쓰는 모든 id 가 HTML 에 있다", not (used_ids - defined_ids),
