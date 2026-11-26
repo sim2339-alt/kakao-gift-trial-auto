@@ -14,6 +14,7 @@
 - 10부: 담당자 열 목록 — 노션 페이지 주소 붙여넣기 정규화 · `_columns` 폴백 · [↻ 새로고침] 검증
 - 11부: 계정 전환 캐시 — 세션 파일이 바뀌면 새 쿠키 · 로그아웃 초기화 · 로그인 계정 닉네임 · 이미 신청 건수 검증
 - 12부: 카카오 닉네임 → 노션 담당자 열 자동 선택 — 매칭 점수 · 계정 변경 · 수동 선택 보호 검증
+- 13부: 계정 메모장(accounts.txt) · 로그인 아이디 미리 채우기 · 완료 알람(크롬 알림) 검증
 """
 
 from __future__ import annotations
@@ -87,7 +88,7 @@ def build_item(title, cats):
 
 
 def test_filter():
-    print("[1/12] 필터 검증")
+    print("[1/13] 필터 검증")
     flt = main.load_filter()
     cases = {
         "수플린 설향딸기 800g": "allow",
@@ -350,7 +351,7 @@ class FakePage:
 
 
 def test_apply_flow():
-    print("[2/12] 신청 플로우 검증 (가짜 브라우저)")
+    print("[2/13] 신청 플로우 검증 (가짜 브라우저)")
     campaign = {
         "campaignId": "abc",
         "campaignTitle": "테스트 상품",
@@ -605,7 +606,7 @@ class use_input:
 
 
 def test_notion():
-    print("[4/12] 노션 기록·설정·실행 모드 검증 (가짜 노션 API)")
+    print("[4/13] 노션 기록·설정·실행 모드 검증 (가짜 노션 API)")
     NOW = datetime(2026, 11, 20, 11, 0, 0)
     CFG = {"token": "ntn_dummy", "db_id": "db-dummy", "column": "메인.엽", "file": "notion_secret.json"}
     item = {
@@ -857,7 +858,7 @@ class FakeStdin:
 
 
 def test_main_modes():
-    print("[5/12] 실행 모드 통합 검증 (main() — 네트워크·브라우저 없이)")
+    print("[5/13] 실행 모드 통합 검증 (main() — 네트워크·브라우저 없이)")
     items = [
         build_item("스누피 3단 전기요", [(97, "디지털·가전", 163, "계절가전")]),
         build_item("수플린 설향딸기 800g", [(93, "식품", 203, "과일·견과")]),
@@ -980,7 +981,7 @@ def cleanup():
 
 # --------------------------------------------- 6부: 웹 조종판(web_ui) 검증
 def test_web():
-    print("[6/12] 웹 조종판 API 검증 (가짜 카카오·노션, 실제 HTTP 서버)")
+    print("[6/13] 웹 조종판 API 검증 (가짜 카카오·노션, 실제 HTTP 서버)")
     import web_ui
 
     web_ui.reset_state()
@@ -1171,7 +1172,7 @@ def test_web():
 
 
 def test_login_logic():
-    print("[3/12] 로그인 로직 검증 (네트워크 없이)")
+    print("[3/13] 로그인 로직 검증 (네트워크 없이)")
     url = main._login_url()
     check("로그인 주소가 웹 로그인 입구(shopping-userauth-web)인가",
           url.startswith("https://shopping-userauth-web.kakao.com/login?channel=GIFT&redirect_url="), url[:80])
@@ -1242,7 +1243,7 @@ def test_login_logic():
 
 # --------------------- 7부: 노션 1회 저장 · 담당자 열만 선택(다시 묻지 않음)
 def test_notion_once():
-    print("[7/12] 노션 1회 저장 · 담당자 열만 선택 검증 (가짜 노션 API)")
+    print("[7/13] 노션 1회 저장 · 담당자 열만 선택 검증 (가짜 노션 API)")
     tmp = ROOT / "logs" / "_once_notion_secret.json"
     tmp.parent.mkdir(exist_ok=True)
     tmp.write_text(json.dumps({"enabled": True, "token": "ntn_saved_once", "db_id": "db-once",
@@ -1424,7 +1425,7 @@ def test_notion_once():
 
 # ------------------------------- 8부: 원스톱 실행(run.bat) · 루트 정리 · 한 화면 흐름
 def test_onestop():
-    print("[8/12] 원스톱 실행기(run.bat) · 루트 정리 · 웹 한 화면 흐름 검증")
+    print("[8/13] 원스톱 실행기(run.bat) · 루트 정리 · 웹 한 화면 흐름 검증")
     root = ROOT
     run_bat = root / "run.bat"
     run_sh = root / "run.sh"
@@ -1484,7 +1485,7 @@ def test_onestop():
 
 
 def test_logout():
-    print("[9/12] 카카오 로그아웃 검증 (세션 파일 삭제 · CLI · 웹)")
+    print("[9/13] 카카오 로그아웃 검증 (세션 파일 삭제 · CLI · 웹)")
     import web_ui
 
     prof = ROOT / "logs" / "_logout_profile"
@@ -1639,7 +1640,7 @@ class StrictNotionStub:
 
 
 def test_column_discovery():
-    print("[10/12] 담당자 열 목록 — 주소 정규화 · 토큰만으로 DB 자동 찾기 · 폴백 · 새로고침 검증")
+    print("[10/13] 담당자 열 목록 — 주소 정규화 · 토큰만으로 DB 자동 찾기 · 폴백 · 새로고침 검증")
     import web_ui
 
     read = lambda: (ROOT / "web_ui.py").read_text(encoding="utf-8")
@@ -1947,7 +1948,7 @@ def test_column_discovery():
 
 # ------------- 11부: 계정 전환 캐시 — 세션 파일 변경 · 로그아웃 · 계정 닉네임 · 이미 신청 건수
 def test_session_cache():
-    print("[11/12] 계정 전환 캐시 — 세션 파일 변경 시 새 쿠키 · 로그아웃 초기화 · 계정 닉네임 · 이미 신청 건수 검증")
+    print("[11/13] 계정 전환 캐시 — 세션 파일 변경 시 새 쿠키 · 로그아웃 초기화 · 계정 닉네임 · 이미 신청 건수 검증")
     import web_ui
 
     statef = ROOT / "logs" / "_session_state.json"
@@ -2158,7 +2159,7 @@ def test_session_cache():
 
 # ------------- 12부: 카카오 닉네임 → 노션 담당자 열 자동 선택
 def test_nickname_columns():
-    print("[12/12] 카카오 닉네임 → 노션 담당자 열 자동 선택 (매칭 점수 · 계정 변경 · 수동 선택 보호)")
+    print("[12/13] 카카오 닉네임 → 노션 담당자 열 자동 선택 (매칭 점수 · 계정 변경 · 수동 선택 보호)")
     import web_ui
 
     # 현황표 담당자 열의 실제 모양(접두사 + 핵심 이름 + 괄호 설명) — 타인 실명은 쓰지 않고 예시 이름만 쓴다
@@ -2346,6 +2347,281 @@ def test_nickname_columns():
         tmp.unlink(missing_ok=True)
 
 
+# --------------------- 13부: 계정 메모장 · 로그인 아이디 · 완료 알람
+def test_accounts_alarm():
+    print("[13/13] 계정 메모장(accounts.txt) · 로그인 아이디 미리 채우기 · 완료 알람 검증")
+    import web_ui
+
+    # 1) 메모장 파싱 규칙 — 빈 줄·주석·'별명 | 아이디'·줄 끝 주석·중복
+    text = "\n".join([
+        "# 한 줄에 하나씩",
+        "",
+        "  # 들여쓴 주석도 무시",
+        "myid@kakao.com",
+        "엄마 | mom@kakao.com",
+        "  나 |  010-1234-5678   # 개인 번호",
+        "myid@kakao.com            # 중복",
+        "dad@kakao.com # 뒤 주석",
+        "|",
+    ])
+    rows = web_ui.parse_accounts(text)
+    check("메모장: 빈 줄·주석 무시", len(rows) == 4, str(rows))
+    check("메모장: 아이디 단독 형식", rows[0] == {"label": "", "account": "myid@kakao.com"}, str(rows[0]))
+    check("메모장: '별명 | 아이디' 지원", rows[1] == {"label": "엄마", "account": "mom@kakao.com"}, str(rows[1]))
+    check("메모장: 줄 끝 # 주석 제거", rows[2]["account"] == "010-1234-5678" and rows[3]["account"] == "dad@kakao.com",
+          str(rows[2:]))
+    check("메모장: 중복 아이디는 한 번만", [r["account"] for r in rows].count("myid@kakao.com") == 1, str(rows))
+    check("메모장: 이름 없는 '|' 줄은 버린다", all(r["account"] for r in rows), str(rows))
+    check("메모장: 빈 내용", web_ui.parse_accounts("") == [])
+
+    # 2) 파일 읽기/저장 — BOM(윈도우 메모장) · 없음 상태 · 저장 · CRLF · 크기 제한
+    tmp_dir = ROOT / "logs"
+    tmp_dir.mkdir(exist_ok=True)
+    tmp = tmp_dir / "_accounts_test.txt"
+    saved_path = web_ui.ACCOUNTS_FILE
+    web_ui.ACCOUNTS_FILE = str(tmp)
+    try:
+        miss = web_ui.read_accounts()
+        check("메모장: 파일이 없으면 exists=False · 빈 목록",
+              miss["ok"] is True and miss["exists"] is False and miss["accounts"] == [], str(miss))
+        tmp.write_bytes("\ufeff# 메모\n나 | me@kakao.com\nmom@kakao.com\n".encode("utf-8"))
+        got = web_ui.read_accounts()
+        check("메모장: BOM 있는 파일도 읽는다", got["exists"] is True and got["count"] == 2, str(got.get("accounts")))
+        check("메모장: 읽은 내용을 화면에 그대로 준다", "mom@kakao.com" in (got.get("text") or ""))
+        sv = web_ui.save_accounts("새 | new@kakao.com\n")
+        again = web_ui.read_accounts()
+        check("메모장: 화면에서 저장", sv["ok"] is True and sv.get("saved") is True and again["count"] == 1
+              and again["accounts"][0]["account"] == "new@kakao.com", str(again.get("accounts")))
+        check("메모장: 윈도우 메모장 호환 CRLF 로 쓴다", b"\r\n" in tmp.read_bytes(), str(tmp.read_bytes()[:40]))
+        check("메모장: 너무 큰 내용은 거부",
+              web_ui.save_accounts("x" * (web_ui.ACCOUNTS_MAX_BYTES + 10))["ok"] is False)
+    finally:
+        tmp.unlink(missing_ok=True)
+        web_ui.ACCOUNTS_FILE = saved_path
+
+    # 3) 로그인 실행 인자 · 아이디 정리
+    argv = web_ui.login_argv("me@kakao.com")
+    check("로그인: 실행 인자에 --login · --login-id", "--login" in argv and argv[-2:] == ["--login-id", "me@kakao.com"],
+          str(argv))
+    check("로그인: 아이디가 없으면 --login-id 를 붙이지 않는다",
+          "--login-id" not in web_ui.login_argv(""), str(web_ui.login_argv("")))
+    check("로그인: 아이디 앞뒤 공백·줄바꿈 제거",
+          web_ui.normalize_login_id("  me@kakao.com\n") == "me@kakao.com"
+          and "\n" not in web_ui.normalize_login_id("a\nb"), repr(web_ui.normalize_login_id("a\nb")))
+    check("로그인: 아이디 길이 제한(120자)", len(web_ui.normalize_login_id("a" * 500)) == 120)
+
+    # 4) 로그인 창 실행(진짜 브라우저 대신 가짜 프로세스)
+    saved_login_state = main.login_state
+    main.login_state = lambda: {"state": "none", "detail": "테스트"}
+    real_popen = web_ui.subprocess.Popen
+    started = []
+
+    class FakeProc:
+        def __init__(self, argv, **kwargs):
+            self.argv = argv
+            self.kwargs = kwargs
+            self.stdout = []
+            self.returncode = None
+            started.append(self)
+
+        def wait(self):
+            self.returncode = 0
+            return 0
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+    web_ui.subprocess.Popen = FakeProc
+    try:
+        web_ui.reset_state()
+        r = web_ui.start_login("mom@kakao.com")
+        for _ in range(150):
+            if started:
+                break
+            time.sleep(0.02)
+        check("웹: 로그인 창이 고른 아이디를 넘긴다", r["ok"] is True and r.get("login_id") == "mom@kakao.com", str(r))
+        check("웹: 로그인 창 실행 인자", started and started[0].argv[-2:] == ["--login-id", "mom@kakao.com"],
+              str(started[0].argv if started else None))
+        check("웹: 로그인 안내 로그에 아이디", any("mom@kakao.com" in l for l in web_ui.log_payload(0)["lines"]),
+              str(web_ui.log_payload(0)["lines"][:3]))
+        busy = FakeProc(["fake"])
+        web_ui.STATE["proc"] = busy
+        r2 = web_ui.start_login("other@kakao.com")
+        check("웹: 로그인 창이 이미 열려 있으면 거부", r2["ok"] is False and "이미" in r2["error"], str(r2))
+    finally:
+        web_ui.subprocess.Popen = real_popen
+        main.login_state = saved_login_state
+        web_ui.reset_state()
+
+    # 5) main.py — 로그인 아이디 미리 채우기(아이디만, 비밀번호·제출 없음)
+    class FillBox:
+        def __init__(self, page, sel):
+            self.page = page
+            self.sel = sel
+
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return self.sel not in self.page.hidden
+
+        def fill(self, value, timeout=None):
+            if self.page.fill_error:
+                raise RuntimeError("fill 실패")
+            self.page.filled.append((self.sel, value))
+
+    class FillPage:
+        def __init__(self, hidden=(), fill_error=False, appears_after=0):
+            self.hidden = set(hidden)
+            self.fill_error = fill_error
+            self.filled = []
+            self.waits = 0
+            self.appears_after = appears_after
+            if appears_after:
+                self.hidden = set(main.LOGIN_ID_SELECTORS)
+
+        def locator(self, sel):
+            return FillBox(self, sel)
+
+        def wait_for_timeout(self, ms):
+            self.waits += 1
+            if self.appears_after and self.waits >= self.appears_after:
+                self.hidden = set()
+
+    page = FillPage()
+    ok_fill = main._fill_login_id(page, "  mom@kakao.com  ")
+    check("아이디 채우기: 첫 입력칸에 채운다", ok_fill is True
+          and page.filled == [('input[name="loginId"]', "mom@kakao.com")], str(page.filled))
+    page = FillPage(hidden=main.LOGIN_ID_SELECTORS[:2])
+    main._fill_login_id(page, "mom@kakao.com")
+    check("아이디 채우기: 화면이 바뀌면 다음 셀렉터로 폴백", page.filled
+          and page.filled[0][0] == main.LOGIN_ID_SELECTORS[2], str(page.filled))
+    page = FillPage(fill_error=True)
+    ok_err = main._fill_login_id(page, "mom@kakao.com")
+    check("아이디 채우기: fill 실패해도 예외 없이 넘어간다", ok_err is False and page.filled == [])
+    page = FillPage(hidden=main.LOGIN_ID_SELECTORS)
+    ok_none = main._fill_login_id(page, "mom@kakao.com", wait_seconds=0.05)
+    check("아이디 채우기: 입력칸이 없으면 기다렸다 포기(로그인은 계속)", ok_none is False and page.waits >= 1, str(page.waits))
+    page = FillPage(appears_after=2)
+    ok_late = main._fill_login_id(page, "mom@kakao.com", wait_seconds=5)
+    check("아이디 채우기: 화면이 늦게 떠도 다시 시도해 채운다", ok_late is True and len(page.filled) == 1, str(page.filled))
+    page = FillPage()
+    check("아이디 채우기: 아이디가 비면 아무것도 하지 않는다",
+          main._fill_login_id(page, "") is False and page.filled == [] and page.waits == 0)
+    page = FillPage()
+    main._fill_login_id(page, "pw-test")
+    check("아이디 채우기: 비밀번호 칸은 건드리지 않는다",
+          all("password" not in sel.lower() for sel, _ in page.filled), str(page.filled))
+
+    # 6) CLI 배선 — --login --login-id 가 run_login 으로 전달되는지
+    saved_run_login = main.run_login
+    seen = {}
+
+    def fake_run_login(mode="desktop", login_id=""):
+        seen.update({"mode": mode, "login_id": login_id})
+        return 0
+
+    main.run_login = fake_run_login
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = main.main(["--login", "--login-id", "mom@kakao.com"])
+        check("CLI: --login --login-id → run_login(login_id)",
+              rc == 0 and seen.get("login_id") == "mom@kakao.com", str(seen))
+        with contextlib.redirect_stdout(io.StringIO()):
+            main.main(["--login"])
+        check("CLI: --login-id 가 없으면 빈 값", seen.get("login_id") == "", str(seen))
+        main.main(["--login-mobile", "--login-id", "mom@kakao.com"])
+        check("CLI: --login-mobile 과 함께도 아이디 전달", seen.get("mode") == "mobile", str(seen))
+    finally:
+        main.run_login = saved_run_login
+        main.reset_stop()
+
+    # 7) 화면 — 계정 메모장 · 완료 알람 UI 와 스크립트
+    html = web_ui.PAGE_HTML
+    check("웹 화면: 저장된 아이디 선택 · 메모장 불러오기 · 편집",
+          'id="loginId"' in html and "메모장 불러오기" in html and "메모장 편집" in html, "")
+    check("웹 화면: 선택 아이디를 localStorage 에 기억",
+          'id="loginId"' in html and "kt_login_id" in html and "localStorage" in html, "")
+    check("웹 화면: 로그인 창 열 때 고른 아이디를 보낸다", 'api("/api/login", { login_id: loginId })' in html, "")
+    check("웹 화면: 완료 알람 토글 · 알람음 · 권한 버튼",
+          'id="alarmOn"' in html and 'id="alarmSound"' in html and 'id="btnAlarmPerm"' in html
+          and "완료 알람" in html, "")
+    check("웹 화면: 크롬 알림 요청·발송",
+          "Notification.requestPermission" in html and "new Notification(" in html
+          and "카카오 체험단 신청 완료" in html and "카카오 체험단 작업 종료" in html, "")
+    check("웹 화면: 알림 클릭 시 창 포커스 · 닫기", "window.focus()" in html and "n.close()" in html, "")
+    check("웹 화면: 두 음짜리 알림음(Web Audio)",
+          "AudioContext" in html and "createOscillator" in html, "")
+    check("웹 화면: 백그라운드 탭 제목 점멸 · 복원",
+          "function flashTitle" in html and "function stopFlashTitle" in html and "visibilitychange" in html, "")
+    check("웹 화면: 실행 중→끝남 전이에서만 알린다(중복 방지)",
+          "prevRunning === true" in html and "lastNotifiedFinish" in html, "")
+    used_ids = set(re.findall(r'\$\("([A-Za-z0-9_-]+)"\)', html))
+    defined_ids = set(re.findall(r'id="([A-Za-z0-9_-]+)"', html))
+    check("웹 화면: 스크립트가 쓰는 모든 id 가 HTML 에 있다", not (used_ids - defined_ids),
+          str(sorted(used_ids - defined_ids)))
+    check("웹 화면: 새 UI 칸이 모두 있다",
+          {"loginId", "accountsText", "btnSaveAccounts", "alarmOn", "alarmSound", "btnAlarmPerm"} <= defined_ids,
+          str(sorted({"loginId", "accountsText", "btnSaveAccounts", "alarmOn", "alarmSound", "btnAlarmPerm"} - defined_ids)))
+
+    # 8) /api/accounts · /api/login (실제 HTTP 서버 · 가짜 로그인 프로세스)
+    tmp_http = tmp_dir / "_accounts_http.txt"
+    saved_path = web_ui.ACCOUNTS_FILE
+    web_ui.ACCOUNTS_FILE = str(tmp_http)
+    tmp_http.unlink(missing_ok=True)
+    started.clear()
+    web_ui.subprocess.Popen = FakeProc
+    main.login_state = lambda: {"state": "none", "detail": "테스트"}
+    web_ui.reset_state()
+    httpd = web_ui.make_server("127.0.0.1", 0)
+    port = httpd.server_address[1]
+    th = threading.Thread(target=httpd.serve_forever, daemon=True)
+    th.start()
+    base = f"http://127.0.0.1:{port}"
+    try:
+        first = json.loads(urllib.request.urlopen(base + "/api/accounts", timeout=10).read().decode("utf-8"))
+        check("웹: GET /api/accounts (파일 없음 → exists=False)",
+              first.get("ok") is True and first.get("exists") is False and first.get("accounts") == [], str(first)[:150])
+        req = urllib.request.Request(base + "/api/accounts",
+                                     data=json.dumps({"text": "엄마 | mom@kakao.com\nmyid@kakao.com\n"},
+                                                     ensure_ascii=False).encode("utf-8"),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        posted = json.loads(urllib.request.urlopen(req, timeout=10).read().decode("utf-8"))
+        check("웹: POST /api/accounts 저장", posted.get("ok") is True and posted.get("count") == 2
+              and tmp_http.is_file(), str(posted)[:150])
+        second = json.loads(urllib.request.urlopen(base + "/api/accounts", timeout=10).read().decode("utf-8"))
+        check("웹: 저장한 메모장을 다시 읽는다", second.get("count") == 2
+              and second["accounts"][0] == {"label": "엄마", "account": "mom@kakao.com"}, str(second.get("accounts")))
+        req2 = urllib.request.Request(base + "/api/login",
+                                      data=json.dumps({"login_id": "mom@kakao.com"}).encode("utf-8"),
+                                      headers={"Content-Type": "application/json"}, method="POST")
+        login_res = json.loads(urllib.request.urlopen(req2, timeout=10).read().decode("utf-8"))
+        for _ in range(150):
+            if started:
+                break
+            time.sleep(0.02)
+        check("웹: POST /api/login 이 고른 아이디로 로그인 창 실행",
+              login_res.get("ok") is True and login_res.get("login_id") == "mom@kakao.com"
+              and started and started[0].argv[-2:] == ["--login-id", "mom@kakao.com"],
+              str(login_res) + " / " + str(started[0].argv if started else None))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        th.join(timeout=3)
+        web_ui.subprocess.Popen = real_popen
+        main.login_state = saved_login_state
+        web_ui.ACCOUNTS_FILE = saved_path
+        web_ui.reset_state()
+        tmp_http.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     test_filter()
     test_apply_flow()
@@ -2359,6 +2635,7 @@ if __name__ == "__main__":
     test_column_discovery()
     test_session_cache()
     test_nickname_columns()
+    test_accounts_alarm()
     cleanup()
     print()
     if FAILS:

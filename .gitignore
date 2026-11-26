@@ -19,3 +19,7 @@ venv/
 # 노션 연동 설정(API 토큰 포함) — 절대 커밋 금지
 # 예시는 notion_secret.example.json 을 보세요.
 notion_secret.json
+
+# 로그인 아이디 메모장(개인 이메일·전화번호) — 절대 커밋 금지
+# 예시는 accounts.example.txt 를 보세요.
+accounts.txt

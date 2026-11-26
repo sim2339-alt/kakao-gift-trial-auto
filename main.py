@@ -4,6 +4,7 @@
 
 사용법
   python main.py --login            최초 1회: 브라우저에서 카카오 로그인 후 세션 저장
+  python main.py --login --login-id mom@kakao.com   로그인 아이디만 미리 채운 채 로그인 창 열기
   python main.py --dry-run          실제 신청 없이 오늘 후보 목록만 확인
   python main.py --limit 100        후보 상위 100개 실제 신청 (기본값 100)
   python main.py --limit 0          지금 신청 가능한 후보 전체 신청 (0 = 제한 없음)
@@ -89,6 +90,19 @@ USER_INFO_CACHE_SECONDS = 60
 STATE_FILE = "kakao_state.json"
 LOGIN_WAIT_SECONDS = 180
 LOGIN_POLL_SECONDS = 2
+# 로그인 아이디(계정 메모장에서 고른 값) 미리 채우기 — 아이디만 채우고 비밀번호는 채우지 않는다.
+LOGIN_ID_FILL_WAIT_SECONDS = 8.0
+LOGIN_ID_SELECTORS = (
+    'input[name="loginId"]',
+    'input#loginId--1',
+    'input#loginId',
+    'input[autocomplete="username"]',
+    'input[placeholder*="카카오메일"]',
+    'input[placeholder*="이메일"]',
+    'input[placeholder*="전화번호"]',
+    'input[type="email"]',
+    'input[type="text"]',
+)
 
 # 목록 API 정렬은 CREATED_AT만 허용된다.
 # sortProperty=APPLY_COUNT 는 서버가 HTTP 400 을 돌려주므로, 인기순은 받아온 뒤 로컬에서 정렬한다.
@@ -1806,7 +1820,43 @@ def _verify_mobile_session(p) -> tuple:
             pass
 
 
-def run_login(mode: str = "desktop") -> int:
+def _fill_login_id(page, login_id: str, wait_seconds: float = LOGIN_ID_FILL_WAIT_SECONDS) -> bool:
+    """로그인 창의 아이디 입력칸에 login_id 를 미리 채운다(비밀번호는 채우지 않음).
+
+    카카오 로그인 주소(accounts.kakao.com/login)로 넘어간 뒤 화면이 그려질 때까지 잠깐 기다렸다가
+    보이는 첫 입력칸에 fill() 한다. 셀렉터는 화면 개편에 대비해 여러 개를 차례로 시도하고,
+    하나도 못 찾거나 fill 이 실패해도 로그인 대기 흐름이 끊기지 않도록 예외를 밖으로 던지지 않는다.
+    """
+    login_id = (login_id or "").strip()
+    if not login_id:
+        return False
+    try:
+        deadline = time.time() + max(0.0, float(wait_seconds or 0))
+    except (TypeError, ValueError):
+        deadline = time.time()
+    while True:
+        for sel in LOGIN_ID_SELECTORS:
+            try:
+                loc = page.locator(sel).first
+                if not _visible(loc):
+                    continue
+                loc.fill(login_id, timeout=3000)
+                print(f"[로그인] 저장된 아이디를 미리 채웠습니다: {login_id}")
+                print("         비밀번호만 입력하고 [로그인]을 눌러 주세요(비밀번호는 저장하지 않습니다).")
+                return True
+            except Exception:
+                continue          # 다음 셀렉터로 넘어간다(화면 개편·일시 렌더링 실패 대비)
+        if time.time() >= deadline:
+            break
+        try:
+            page.wait_for_timeout(400)
+        except Exception:
+            time.sleep(0.4)
+    print("[안내] 아이디 입력칸을 자동으로 찾지 못했습니다. 화면에서 직접 입력해 주세요.")
+    return False
+
+
+def run_login(mode: str = "desktop", login_id: str = "") -> int:
     from playwright.sync_api import sync_playwright
 
     login_url = _login_url()
@@ -1844,12 +1894,18 @@ def run_login(mode: str = "desktop") -> int:
         print("    기다리지 않으려면 이 검은 창에서 Enter 를 누르세요.")
         print(" 3) 창이 저절로 닫히고 [완료] 로그인 세션이 감지·저장되었습니다! 가 나오면 끝입니다.")
         print("=" * 68)
+        login_id = (login_id or "").strip()
+        if login_id:
+            print(f"  로그인 아이디 '{login_id}' 를 아이디 칸에 미리 채웁니다. 비밀번호만 입력하세요.")
         print(f"  로그인 주소: {login_url}")
         print()
         try:
             page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
         except Exception as exc:
             print(f"[경고] 로그인 페이지를 여는 중 지연이 있었습니다({type(exc).__name__}). 창을 직접 확인해 주세요.")
+
+        # 아이디 미리 채우기 — 실패해도 아래 로그인 대기 흐름은 그대로 이어집니다.
+        _fill_login_id(page, login_id)
 
         ok, checks = _wait_for_login(page, ctx, LOGIN_WAIT_SECONDS)
 
@@ -2456,6 +2512,9 @@ def main(argv=None) -> int:
     ap.add_argument("--login", action="store_true", help="최초 1회 카카오 로그인 후 세션 저장")
     ap.add_argument("--login-mobile", action="store_true",
                     help="--login 과 함께: 모바일(iPhone) 화면에서 로그인 (데스크톱 로그인으로 세션이 안 잡힐 때)")
+    ap.add_argument("--login-id", dest="login_id", default="",
+                    help="--login 과 함께: 계정 메모장(accounts.txt)에서 고른 로그인 아이디(메일·전화번호)를 "
+                         "로그인 창에 미리 채운다(비밀번호는 채우지 않음)")
     ap.add_argument("--logout", action="store_true",
                     help="저장된 카카오 로그인 세션을 지운다(다른 계정으로 다시 로그인할 수 있게)")
     ap.add_argument("--dry-run", action="store_true", help="실제 신청 없이 후보 목록만 출력")
@@ -2519,7 +2578,7 @@ def main(argv=None) -> int:
 
     if args.login or args.login_mobile:
         try:
-            return run_login("mobile" if args.login_mobile else "desktop")
+            return run_login("mobile" if args.login_mobile else "desktop", login_id=args.login_id or "")
         except ImportError:
             print("[오류] playwright 가 설치되지 않았습니다. run.bat 을 다시 실행해 주세요(자동 설치).")
             return 1

@@ -31,11 +31,14 @@ from pathlib import Path
 
 import main
 
-APP_VERSION = "2.6"
+APP_VERSION = "2.7"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 LOG_MAX = 4000          # 로그 창에 보관할 최대 줄 수
 ROOT = Path(__file__).resolve().parent
+# 로그인 아이디 메모장 — 한 줄에 하나씩. 개인 메일·아이디가 들어가므로 .gitignore 에 있다(커밋 금지).
+ACCOUNTS_FILE = "accounts.txt"
+ACCOUNTS_MAX_BYTES = 200_000
 
 
 def now_text() -> str:
@@ -108,6 +111,78 @@ class LineWriter(io.TextIOBase):
 
     def isatty(self):
         return False
+
+
+# ---------------------------------------------------------------------------
+# 0-B. 계정 메모장(accounts.txt) — 로그인 아이디 목록
+#   · 사용자가 윈도우 메모장에서 직접 적어 두는 파일. 웹 조종판에서도 읽고 바로 고칠 수 있다.
+#   · 빈 줄과 '#' 주석 줄은 무시하고, '별명 | 아이디' 와 '아이디' 단독 형식을 모두 받는다.
+#   · 파일 내용을 화면으로 돌려주지만 이 PC(127.0.0.1) 안에서만 열리는 화면이다.
+# ---------------------------------------------------------------------------
+def accounts_path() -> Path:
+    p = Path(ACCOUNTS_FILE)
+    return p if p.is_absolute() else ROOT / p
+
+
+def parse_accounts(text: str) -> list:
+    """메모장 내용 → [{'label': 별명, 'account': 아이디}] (주석·빈 줄 무시, 중복 제거)."""
+    rows, seen = [], set()
+    for raw in str(text or "").splitlines():
+        line = raw.split("#", 1)[0].strip()      # 줄 끝 주석(# 메모)까지 처리
+        if not line:
+            continue
+        label, account = "", line
+        if "|" in line:
+            left, right = line.split("|", 1)
+            label, account = left.strip(), right.strip()
+        if not account:
+            continue
+        key = account.lower()                     # 메일 주소는 대소문자만 다른 중복도 한 번만
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({"label": label, "account": account})
+    return rows
+
+
+def read_accounts() -> dict:
+    """메모장을 읽어 목록으로 돌려준다. 파일이 없어도 오류가 아니라 exists=False 로 알린다."""
+    p = accounts_path()
+    base = {"exists": p.is_file(), "accounts": [], "count": 0, "text": "",
+            "name": p.name, "path": str(p)}
+    if not base["exists"]:
+        return {"ok": True, **base}
+    try:
+        text = p.read_text(encoding="utf-8-sig")    # 윈도우 메모장이 붙이는 BOM 도 읽는다
+    except Exception as exc:
+        return {"ok": False, **base, "error": f"메모장을 읽지 못했습니다({type(exc).__name__})."}
+    accounts = parse_accounts(text)
+    return {"ok": True, **base, "accounts": accounts, "count": len(accounts), "text": text}
+
+
+def save_accounts(text) -> dict:
+    """웹 조종판에서 고친 메모장 내용을 accounts.txt 에 저장한다(줄바꿈은 윈도우 메모장 호환 CRLF)."""
+    if not isinstance(text, str):
+        return {"ok": False, "error": "메모장 내용이 올바르지 않습니다."}
+    if len(text.encode("utf-8")) > ACCOUNTS_MAX_BYTES:
+        return {"ok": False, "error": f"메모장 내용이 너무 깁니다({ACCOUNTS_MAX_BYTES // 1000}KB 이하로 줄여 주세요)."}
+    p = accounts_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w", encoding="utf-8", newline="\r\n") as f:
+            f.write(text)
+    except Exception as exc:
+        return {"ok": False, "error": f"메모장에 저장하지 못했습니다({type(exc).__name__})."}
+    res = read_accounts()
+    res.update({"ok": True, "saved": True, "saved_at": now_text()})
+    add_line(f"[메모장] 로그인 아이디 {res.get('count', 0)}개를 저장했습니다 · {p.name}")
+    return res
+
+
+def normalize_login_id(login_id) -> str:
+    """고른 로그인 아이디를 정리한다(줄바꿈·제어문자 제거, 120자 제한)."""
+    text = "".join(ch for ch in str(login_id or "") if ch.isprintable()).strip()
+    return text[:120]
 
 
 def log_payload(since: int = 0) -> dict:
@@ -869,7 +944,8 @@ def _run_main(argv: list):
         lines = list(STATE["console"])
         STATE["phase"] = "idle"
         STATE["finished_at"] = now_text()
-        STATE["summary"] = {"rc": rc, **_parse_summary(lines)}
+        # stopped: 사용자가 [중단]을 눌러 멈춘 실행인지 — 완료 알람 제목·본문에 쓴다.
+        STATE["summary"] = {"rc": rc, "stopped": bool(main.stop_requested()), **_parse_summary(lines)}
     add_line(f"[종료] 코드 {rc}")
 
 
@@ -908,17 +984,27 @@ def stop_job() -> dict:
     return {"ok": True}
 
 
-def start_login() -> dict:
+def login_argv(login_id: str = "") -> list:
+    """로그인 창을 여는 main.py 실행 인자 — 고른 아이디가 있으면 --login-id 로 넘긴다."""
+    argv = [sys.executable or "python", str(ROOT / "main.py"), "--login"]
+    if login_id:
+        argv += ["--login-id", login_id]
+    return argv
+
+
+def start_login(login_id: str = "") -> dict:
     proc = STATE.get("proc")
     if proc is not None and proc.poll() is None:
         return {"ok": False, "error": "이미 로그인 창이 열려 있습니다."}
-    script = str(ROOT / "main.py")
+    login_id = normalize_login_id(login_id)
+    argv = login_argv(login_id)
 
     def run():
-        add_line("[로그인] 데스크톱 로그인 창을 엽니다. 창에서 카카오 로그인을 끝까지 마쳐 주세요.")
+        add_line("[로그인] 데스크톱 로그인 창을 엽니다. 창에서 카카오 로그인을 끝까지 마쳐 주세요."
+                 + (f" (아이디 '{login_id}' 를 미리 채웁니다 · 비밀번호만 입력)" if login_id else ""))
         try:
             env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
-            p = subprocess.Popen([sys.executable or "python", script, "--login"], cwd=str(ROOT),
+            p = subprocess.Popen(argv, cwd=str(ROOT),
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                  encoding="utf-8", errors="replace", bufsize=1, env=env)
         except Exception as exc:
@@ -935,7 +1021,7 @@ def start_login() -> dict:
         add_line(f"[로그인] 창이 닫혔습니다. 로그인 상태: {state['state']} ({state['detail']})")
 
     threading.Thread(target=run, daemon=True, name="login-window").start()
-    return {"ok": True}
+    return {"ok": True, "login_id": login_id, "argv": argv}
 
 
 # ---------------------------------------------------------------------------
@@ -990,6 +1076,8 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 since = 0
             self._json(log_payload(since))
+        elif path == "/api/accounts":
+            self._json(read_accounts())
         elif path == "/favicon.ico":
             self._send(204, b"", "image/x-icon")
         else:
@@ -1025,7 +1113,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/stop":
             self._json(stop_job())
         elif path == "/api/login":
-            self._json(start_login())
+            self._json(start_login(payload.get("login_id") or ""))
+        elif path == "/api/accounts":
+            self._json(save_accounts(payload.get("text") if payload.get("text") is not None else ""))
         elif path == "/api/check-login":
             self._json({"ok": True, **check_login()})
         elif path == "/api/logout":
@@ -1130,6 +1220,10 @@ PAGE_HTML = r"""<!DOCTYPE html>
   input[type=number]{width:110px}
   input[type=password]{min-width:240px}
   select{min-width:150px}
+  textarea{font:13px/1.65 ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;color:var(--text);
+        background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:11px 13px;width:100%;
+        min-height:170px;resize:vertical;white-space:pre;overflow:auto}
+  textarea:focus{outline:2px solid var(--accent);outline-offset:1px}
   details.admin{margin-top:12px;border-top:1px dashed var(--line);padding-top:10px}
   details.admin summary{cursor:pointer;font-size:12.5px;color:var(--muted);list-style:none}
   details.admin summary::-webkit-details-marker{display:none}
@@ -1188,6 +1282,28 @@ PAGE_HTML = r"""<!DOCTYPE html>
     </div>
   </header>
   <p class="hint" style="margin:-8px 0 16px">한 화면에서 끝납니다 — ① [카카오 로그인 창 열기](처음 한 번) → ② 기록할 담당자 열(닉네임과 비슷한 열은 자동 선택) → ③ [후보 목록 불러오기] → ④ [자동 신청 시작]</p>
+
+  <section class="card">
+    <h2>카카오 로그인 아이디 <span class="muted" id="accountsNote" style="font-weight:400;text-transform:none;letter-spacing:0"></span></h2>
+    <div class="row">
+      <label class="field">저장된 아이디 (accounts.txt)
+        <select id="loginId"><option value="">(확인 중…)</option></select>
+      </label>
+      <button class="btn" id="btnReloadAccounts" type="button">↻ 메모장 불러오기</button>
+      <button class="btn" id="btnEditAccounts" type="button">📝 메모장 편집</button>
+    </div>
+    <p class="hint" id="accountsHint">메모장(<code>accounts.txt</code>)에 <b>한 줄에 하나씩</b> 카카오 로그인 아이디를 적어 두면 여기서 골라 쓸 수 있고, <b>[카카오 로그인 창 열기] 때 아이디 칸에 미리 채워집니다.</b> 비밀번호는 채우지도 저장하지도 않습니다.</p>
+    <div class="banner" id="accountsBanner"></div>
+    <div id="accountsEditor" style="display:none">
+      <p class="hint" style="margin-top:12px">한 줄에 하나씩: <code>아이디</code> 또는 <code>별명 | 아이디</code> · <code>#</code> 뒤는 주석으로 무시합니다.</p>
+      <textarea id="accountsText" spellcheck="false" rows="9" placeholder="예)&#10;myid@kakao.com&#10;엄마 | mom@kakao.com&#10;나 | 010-1234-5678"></textarea>
+      <div class="row" style="margin-top:10px">
+        <button class="btn primary" id="btnSaveAccounts" type="button">메모장에 저장</button>
+        <button class="btn" id="btnCloseAccounts" type="button">닫기</button>
+        <span class="muted" id="accountsEditState"></span>
+      </div>
+    </div>
+  </section>
 
   <section class="card">
     <h2>노션 연동 <span class="muted" id="notionSavedNote" style="font-weight:400;text-transform:none;letter-spacing:0"></span></h2>
@@ -1288,6 +1404,13 @@ PAGE_HTML = r"""<!DOCTYPE html>
       <button class="btn danger" id="btnStop" disabled>중단</button>
       <span id="runPill" class="pill"><i class="dot"></i>대기 중</span>
     </div>
+    <div class="row">
+      <label class="check"><input type="checkbox" id="alarmOn" checked>🔔 완료 알람</label>
+      <label class="check"><input type="checkbox" id="alarmSound" checked>🔊 알림음</label>
+      <span id="alarmPill" class="pill"><i class="dot"></i>알람 권한 확인 중…</span>
+      <button class="btn" id="btnAlarmPerm" type="button">🔔 알람 권한 허용</button>
+    </div>
+    <p class="hint">작업이 끝나면 <b>크롬 알림</b>(제목: 카카오 체험단 신청 완료 / 작업 종료 · 성공·스킵·실패 건수)으로 알려 드립니다. 알림을 처음 쓰려면 <b>[알람 권한 허용]</b>을 한 번 누르세요. 알림이 막혀 있으면 짧은 알림음과 탭 제목 점멸로도 알려 줍니다.</p>
     <div class="banner" id="runBanner"></div>
     <pre id="log"></pre>
     <div class="stat" id="runStat" style="display:none">
@@ -1307,6 +1430,9 @@ const COLUMN_HINT_DEFAULT = "노션 토큰·DB ID 는 <b>한 번 저장하면 �
 let mode = "notion";
 let logSince = 0;
 let busy = false;
+const LOGIN_ID_KEY = "kt_login_id";      /* 마지막으로 고른 로그인 아이디 */
+const ALARM_KEY = "kt_alarm_on";         /* 완료 알람 켜짐(기본 켜짐) */
+const SOUND_KEY = "kt_alarm_sound";      /* 알림음 켜짐 */
 
 function esc(s){ return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
@@ -1341,6 +1467,166 @@ function banner(el, text, kind){
   el.textContent = text;
   el.dataset.kind = kind || "info";
 }
+
+function lsGet(key, def){
+  try{ const v = localStorage.getItem(key); return v === null ? def : v; }catch(e){ return def; }
+}
+function lsSet(key, val){
+  try{ localStorage.setItem(key, val); }catch(e){ /* 저장이 막혀도 화면은 그대로 쓴다 */ }
+}
+
+/* ── 계정 메모장(accounts.txt) ──────────────────────── */
+let accounts = [];
+
+function renderAccounts(r){
+  accounts = (r && r.accounts) || [];
+  const sel = $("loginId");
+  const saved = lsGet(LOGIN_ID_KEY, null);
+  const known = accounts.some(a => a.account === (saved || ""));
+  const opts = [];
+  if(saved !== null && saved !== "" && !known)
+    opts.push(`<option value="${esc(saved)}">${esc(saved)} (메모장에 없음)</option>`);
+  accounts.forEach(a => opts.push(`<option value="${esc(a.account)}">${esc((a.label ? a.label + " · " : "") + a.account)}</option>`));
+  opts.push(`<option value="">(아이디를 미리 채우지 않음)</option>`);
+  sel.innerHTML = opts.join("");
+  /* 마지막으로 고른 아이디 → 없으면 첫 번째 → 없으면 미리 채우지 않음 */
+  let pick = saved === null || saved === "" ? (accounts.length ? accounts[0].account : "") : saved;
+  sel.value = pick;
+  if(sel.value !== pick) sel.value = "";
+  const name = (r && r.name) || "accounts.txt";
+  $("accountsNote").textContent = (r && r.exists) ? `· ${accounts.length}개 · ${name}` : `· ${name} 없음`;
+  sel.title = (r && r.exists)
+    ? `${name} 에서 읽은 아이디 ${accounts.length}개`
+    : `${name} 이 아직 없습니다 — [📝 메모장 편집]으로 만들어 저장하세요`;
+}
+
+async function loadAccounts(quiet){
+  let r;
+  try{ r = await api("/api/accounts"); }catch(e){
+    if(!quiet) banner($("accountsBanner"), "메모장을 불러오지 못했습니다(조종판과의 연결 확인).", "err");
+    return;
+  }
+  if(!r.ok){ banner($("accountsBanner"), r.error || "메모장을 읽지 못했습니다.", "err"); return; }
+  renderAccounts(r);
+  $("accountsText").value = r.text || "";
+  if(!quiet){
+    banner($("accountsBanner"), r.exists
+      ? `메모장에서 아이디 ${r.count}개를 불러왔습니다. (${r.name || "accounts.txt"})`
+      : "accounts.txt 가 아직 없습니다. [📝 메모장 편집]으로 아이디를 적고 저장하면 다음부터 골라 쓸 수 있습니다.", "info");
+  }
+}
+
+/* ── 완료 알람 (크롬 알림 · 알림음 · 제목 점멸) ─────── */
+let alarmOn = lsGet(ALARM_KEY, "1") !== "0";
+let soundOn = lsGet(SOUND_KEY, "1") !== "0";
+let prevRunning = null;       /* 실행 상태 전이(running → 종료)를 한 번만 알리기 위한 기억 */
+let lastNotifiedFinish = null;
+let titleTimer = null;
+let audioCtx = null;
+const BASE_TITLE = document.title;
+
+function notifSupported(){ return "Notification" in window; }
+
+function renderAlarm(){
+  $("alarmOn").checked = alarmOn;
+  $("alarmSound").checked = soundOn;
+  const btn = $("btnAlarmPerm");
+  if(!notifSupported()){
+    setPill($("alarmPill"), "warn", "이 브라우저는 크롬 알림 미지원 · 알림음·제목 표시만");
+    btn.disabled = true;
+    btn.textContent = "🔔 알림 미지원";
+    return;
+  }
+  const p = Notification.permission;
+  if(p === "granted"){
+    setPill($("alarmPill"), alarmOn ? "ok" : "", alarmOn ? "완료 알람 켜짐 · 크롬 알림 허용됨" : "완료 알람 꺼짐");
+    btn.disabled = true;
+    btn.textContent = "🔔 알림 허용됨";
+  } else if(p === "denied"){
+    setPill($("alarmPill"), "bad", "알림 차단됨 — 주소창 자물쇠 → 알림 → 허용");
+    btn.disabled = false;
+    btn.textContent = "🔔 알람 권한 허용";
+  } else {
+    setPill($("alarmPill"), "warn", "알림 권한 필요 — [알람 권한 허용]을 눌러 주세요");
+    btn.disabled = false;
+    btn.textContent = "🔔 알람 권한 허용";
+  }
+}
+
+async function askAlarmPermission(){
+  if(!notifSupported()){
+    banner($("runBanner"), "이 브라우저는 크롬 알림을 지원하지 않습니다(알림음·제목 점멸만 동작).", "err");
+    return false;
+  }
+  try{
+    const res = await Notification.requestPermission();
+    renderAlarm();
+    if(res === "granted"){
+      banner($("runBanner"), "크롬 알림을 허용했습니다. 작업이 끝나면 화면 알림으로 알려 드립니다.", "info");
+      return true;
+    }
+    banner($("runBanner"), "알림이 허용되지 않았습니다. 주소창 왼쪽 자물쇠 → 알림 → 허용으로 바꿀 수 있습니다.", "err");
+  }catch(e){
+    banner($("runBanner"), "알림 권한을 요청하지 못했습니다: " + e, "err");
+  }
+  return false;
+}
+
+function chime(){
+  /* 파일 없이 브라우저 안에서 두 음짜리 차임을 만든다 */
+  try{
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if(!AC) return;
+    if(!audioCtx) audioCtx = new AC();
+    if(audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
+    const t0 = audioCtx.currentTime + 0.02;
+    [[880, 0], [1174.66, 0.17]].forEach(([freq, dt]) => {
+      const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(freq, t0 + dt);
+      gain.gain.setValueAtTime(0.0001, t0 + dt);
+      gain.gain.exponentialRampToValueAtTime(0.16, t0 + dt + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dt + 0.45);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start(t0 + dt); osc.stop(t0 + dt + 0.5);
+    });
+  }catch(e){ /* 소리는 부가 기능 — 실패해도 알림은 그대로 */ }
+}
+
+function flashTitle(){
+  if(!document.hidden || titleTimer) return;
+  let on = false;
+  titleTimer = setInterval(() => {
+    on = !on;
+    document.title = on ? "✅ 체험단 완료 — " + BASE_TITLE : BASE_TITLE;
+  }, 900);
+}
+function stopFlashTitle(){
+  if(titleTimer){ clearInterval(titleTimer); titleTimer = null; }
+  document.title = BASE_TITLE;
+}
+
+function notifyDone(summary, stopped){
+  const s = summary || {};
+  const ok = Number(s.ok || 0), skip = Number(s.skip || 0), fail = Number(s.fail || 0);
+  const parts = [`성공 ${ok}건`, `스킵(이미 신청 등) ${skip}건`, `실패·불확실 ${fail}건`];
+  if(Array.isArray(s.notion)) parts.push(`노션 기록 ${s.notion[0]}건`);
+  if(stopped) parts.push("사용자가 중단");
+  if(s.rc !== undefined && s.rc !== null && s.rc !== 0 && !stopped) parts.push(`종료 코드 ${s.rc}`);
+  const title = (s.rc === 0 && !stopped) ? "카카오 체험단 신청 완료" : "카카오 체험단 작업 종료";
+  const body = parts.join(" · ");
+  if(alarmOn && notifSupported() && Notification.permission === "granted"){
+    try{
+      const n = new Notification(title, { body, tag: "kakao-trial-done" });
+      n.onclick = () => { try{ window.focus(); }catch(e){} try{ n.close(); }catch(e){} };
+    }catch(e){ /* 알림 실패해도 알림음·제목 표시로 알린다 */ }
+  }
+  if(alarmOn && soundOn) chime();
+  if(alarmOn && document.hidden) flashTitle();
+}
+
+document.addEventListener("visibilitychange", () => { if(!document.hidden) stopFlashTitle(); });
+window.addEventListener("focus", stopFlashTitle);
 
 /* ── 상태 ───────────────────────────────────────────── */
 async function refreshStatus(){
@@ -1417,6 +1703,7 @@ async function refreshStatus(){
       : `<option value="">(아직 없음 — [↻ DB 목록])</option>`;
   }
   if(dbs.length){ const cur = dbs.find(d => d.current); if(cur) dsel.value = cur.id; }
+  renderAlarm();     /* 크롬 알림 허용 상태는 브라우저 설정에서 바뀔 수 있어 주기적으로 다시 그린다 */
 }
 
 /* ── 미리보기 ────────────────────────────────────────── */
@@ -1493,6 +1780,15 @@ async function refreshLog(){
     if(atBottom) box.scrollTop = box.scrollHeight;
   }
   const running = !!r.running;
+  /* 완료 알람: 실행 중 → 끝남으로 바뀐 그 순간에만 한 번(새로고침·재확인으로 중복 발송 없음) */
+  if(prevRunning === true && !running){
+    const fin = String(r.finished_at || "") + "|" + String(r.started_at || "");
+    if(r.summary && fin !== lastNotifiedFinish){
+      lastNotifiedFinish = fin;
+      notifyDone(r.summary, !!r.summary.stopped);
+    }
+  }
+  prevRunning = running;
   $("btnStart").disabled = running;
   $("btnStop").disabled = !running;
   $("btnPreview").disabled = running;
@@ -1520,8 +1816,13 @@ $("btnPreview").onclick = loadPreview;
 $("btnStart").onclick = startRun;
 $("btnStop").onclick = stopRun;
 $("btnLogin").onclick = async () => {
-  const r = await api("/api/login", {});
-  banner($("runBanner"), r.ok ? "로그인 창을 열었습니다. PC 화면의 크롬 창에서 로그인을 끝까지 마쳐 주세요." : r.error, r.ok ? "info" : "err");
+  const loginId = $("loginId").value || "";
+  const r = await api("/api/login", { login_id: loginId });
+  const msg = r.ok
+    ? "로그인 창을 열었습니다. PC 화면의 크롬 창에서 로그인을 끝까지 마쳐 주세요."
+      + (r.login_id ? ` 아이디 '${r.login_id}' 는 미리 채워 둠 — 비밀번호만 입력하세요.` : "")
+    : r.error;
+  banner($("runBanner"), msg, r.ok ? "info" : "err");
 };
 $("btnLogout").onclick = async () => {
   if(!confirm("카카오 로그아웃할까요?\n저장된 로그인 세션을 지웁니다(다른 계정으로 다시 로그인할 수 있습니다).")) return;
@@ -1608,8 +1909,62 @@ $("btnReloadCols").onclick = async () => {
   }
 };
 $("column").addEventListener("change", () => { $("previewSummary").style.display = "none"; });
+
+/* ── 계정 메모장 · 완료 알람 이벤트 ─────────────── */
+$("loginId").addEventListener("change", () => lsSet(LOGIN_ID_KEY, $("loginId").value));
+$("btnReloadAccounts").onclick = () => loadAccounts(false);
+$("btnEditAccounts").onclick = async () => {
+  const box = $("accountsEditor");
+  if(box.style.display === "block"){
+    box.style.display = "none";
+    $("btnEditAccounts").textContent = "📝 메모장 편집";
+    return;
+  }
+  await loadAccounts(true);
+  box.style.display = "block";
+  $("btnEditAccounts").textContent = "📝 메모장 접기";
+  $("accountsEditState").textContent = "";
+  $("accountsText").focus();
+};
+$("btnCloseAccounts").onclick = () => {
+  $("accountsEditor").style.display = "none";
+  $("btnEditAccounts").textContent = "📝 메모장 편집";
+};
+$("btnSaveAccounts").onclick = async () => {
+  const btn = $("btnSaveAccounts");
+  btn.disabled = true;
+  $("accountsEditState").textContent = "저장 중…";
+  try{
+    const r = await api("/api/accounts", {text: $("accountsText").value});
+    if(!r.ok){
+      banner($("accountsBanner"), r.error || "저장하지 못했습니다.", "err");
+      $("accountsEditState").textContent = "저장 실패";
+      return;
+    }
+    renderAccounts(r);
+    $("accountsText").value = r.text || "";
+    banner($("accountsBanner"), `메모장에 저장했습니다 · 아이디 ${r.count}개 (${r.name || "accounts.txt"})`, "info");
+    $("accountsEditState").textContent = "저장됨 " + (r.saved_at || "");
+  } finally {
+    btn.disabled = false;
+  }
+};
+$("alarmOn").addEventListener("change", async () => {
+  alarmOn = $("alarmOn").checked;
+  lsSet(ALARM_KEY, alarmOn ? "1" : "0");
+  renderAlarm();
+  if(alarmOn && notifSupported() && Notification.permission === "default") await askAlarmPermission();
+});
+$("alarmSound").addEventListener("change", () => {
+  soundOn = $("alarmSound").checked;
+  lsSet(SOUND_KEY, soundOn ? "1" : "0");
+  if(soundOn) chime();      /* 켤 때 한 번 들려 주어 소리를 확인할 수 있게 */
+});
+$("btnAlarmPerm").onclick = askAlarmPermission;
 $("notionAllWrap").style.display = "flex";
 syncLimitChips();
+renderAlarm();
+loadAccounts(true);
 
 refreshStatus();
 refreshLog();
